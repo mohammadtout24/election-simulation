@@ -1,0 +1,1005 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <title>{{ region_name }} Results</title>
+    <link href="https://cdn.jsdelivr.net/npm/bootstrap@5.1.3/dist/css/bootstrap.min.css" rel="stylesheet">
+    <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800&family=Tajawal:wght@400;500;700&display=swap" rel="stylesheet">
+    <script src="https://cdn.jsdelivr.net/npm/sortablejs@1.15.0/Sortable.min.js"></script>
+    <script src="https://cdn.plot.ly/plotly-2.24.1.min.js"></script>
+    <style>
+        body { background-color: #f0f2f5; font-family: 'Inter', 'Tajawal', system-ui, -apple-system, sans-serif; }
+
+        .seat-badge { background-color: #0d6efd; color: white; padding: 4px 14px; border-radius: 50px; font-size: 0.9rem; margin-left: 12px; font-weight: 600; box-shadow: 0 2px 4px rgba(0,0,0,0.1); }
+        .chart-container { border: 1px solid #dee2e6; border-radius: 10px; padding: 12px; background: white; box-shadow: 0 2px 8px rgba(0,0,0,0.05); margin-bottom: 15px; display: flex; flex-direction: column; min-height: 280px; position: relative; }
+        .chart-legend { position: absolute; top: 15px; right: 15px; display: flex; gap: 10px; font-size: 0.65rem; font-weight: bold; z-index: 10; background: rgba(255, 255, 255, 0.8); padding: 2px 5px; border-radius: 4px; }
+        .legend-item { display: flex; align-items: center; gap: 4px; }
+        .legend-box { width: 10px; height: 10px; border-radius: 2px; }
+        .bg-winner { background-color: #2e7d32; }
+        .bg-loser { background-color: #adb5bd; }
+        .district-label { font-size: 0.65rem; color: #6c757d; text-transform: uppercase; font-weight: bold; letter-spacing: 0.5px; }
+        .religion-title { border-left: 4px solid #2e7d32; padding-left: 10px; margin-bottom: 8px; color: #212529; font-weight: 700; font-size: 0.95rem; }
+        .btn-seemore { font-size: 0.75rem; width: 100%; margin-top: 8px; font-weight: 600; padding: 4px; }
+
+        .history-card { border: none; border-radius: 16px; overflow: hidden; position: sticky; top: 16px; display: flex; flex-direction: column; height: 88vh; max-height: 88vh; background: rgba(255,255,255,0.85); backdrop-filter: blur(20px); -webkit-backdrop-filter: blur(20px); box-shadow: 0 8px 32px rgba(0,0,0,0.12), 0 2px 8px rgba(0,0,0,0.06); border: 1px solid rgba(255,255,255,0.5); transition: all 0.3s cubic-bezier(0.4, 0, 0.2, 1); }
+        .history-card:hover { box-shadow: 0 12px 40px rgba(0,0,0,0.15), 0 4px 12px rgba(0,0,0,0.08); }
+        .history-card.collapsed { height: 52px; min-height: 52px; max-height: 52px; overflow: hidden; }
+        .history-header { background: linear-gradient(135deg, #667eea 0%, #764ba2 100%); color: white; padding: 13px 16px; font-size: 0.9rem; font-weight: 700; direction: rtl; text-align: right; display: flex; justify-content: space-between; align-items: center; flex-shrink: 0; position: relative; z-index: 2; }
+        .history-header::after { content: ''; position: absolute; bottom: 0; left: 0; right: 0; height: 3px; background: linear-gradient(90deg, #00d2ff, #3a7bd5, #00d2ff); background-size: 200% 100%; animation: shimmer 3s ease infinite; }
+        @keyframes shimmer { 0%,100% { background-position: 0% 50%; } 50% { background-position: 100% 50%; } }
+        @keyframes slideIn { from { opacity: 0; transform: translateX(-20px); } to { opacity: 1; transform: translateX(0); } }
+        @keyframes fadeInUp { from { opacity: 0; transform: translateY(10px); } to { opacity: 1; transform: translateY(0); } }
+        @keyframes pulse { 0%,100% { opacity: 1; } 50% { opacity: 0.5; } }
+        @keyframes typingBounce { 0%,80%,100% { transform: scale(0); } 40% { transform: scale(1); } }
+        .header-status { display: flex; align-items: center; gap: 6px; font-size: 0.75rem; font-weight: 500; opacity: 0.9; }
+        .status-dot { width: 7px; height: 7px; border-radius: 50%; background: #4caf50; animation: pulse 2s infinite; box-shadow: 0 0 6px rgba(76,175,80,0.6); }
+        .header-actions { display: flex; gap: 6px; }
+        .header-btn { background: rgba(255,255,255,0.15); border: none; color: white; width: 28px; height: 28px; border-radius: 8px; cursor: pointer; display: flex; align-items: center; justify-content: center; transition: all 0.2s; font-size: 0.8rem; }
+        .header-btn:hover { background: rgba(255,255,255,0.3); transform: scale(1.1); }
+
+        .candidate-card { cursor: grab; padding: 8px 12px; font-size: 0.85rem; margin-bottom: 5px; border-radius: 6px; background: white; border: 1px solid #dee2e6; box-shadow: 0 1px 3px rgba(0,0,0,0.04); transition: transform 0.1s ease; }
+        .candidate-card.winner-card { background-color: #e8f5e9; border-left: 4px solid #2e7d32; color: #1b5e20; }
+        .candidate-card.loser-card { background-color: #ffffff; border-left: 4px solid #ced4da; }
+        .badge-winner { background-color: #2e7d32; color: white; font-size: 0.6rem; padding: 1px 5px; border-radius: 3px; font-weight: bold; margin-top: 4px; display: inline-block; }
+        .list-header { background: #0d6efd; color: white; padding: 8px 12px; font-size: 0.9rem; font-weight: bold; border-radius: 6px 6px 0 0; }
+        .sortable-list { height: 450px; overflow-y: auto; background: #fff; border: 1px solid #dee2e6; border-top: none; padding: 8px; border-radius: 0 0 6px 6px; min-height: 100px; }
+
+        /* Virtual List Builder Specific */
+        .virtual-builder { border: 2px dashed #0d6efd; background: #f0f7ff; border-radius: 10px; margin-bottom: 20px; }
+        .add-btn { cursor: pointer; color: #0d6efd; font-weight: bold; border: 1px solid #0d6efd; border-radius: 4px; padding: 0 6px; transition: all 0.2s; }
+        .add-btn:hover { background: #0d6efd; color: white; }
+
+        /* Selection Action Bar */
+        #selection-bar {
+            display: none;
+            position: sticky;
+            top: 0;
+            z-index: 200;
+            background: linear-gradient(135deg, #0d6efd, #0a58ca);
+            color: white;
+            padding: 12px 20px;
+            border-radius: 10px;
+            margin-bottom: 16px;
+            box-shadow: 0 4px 16px rgba(13,110,253,0.35);
+            align-items: center;
+            gap: 12px;
+            flex-wrap: wrap;
+            animation: slideDown 0.25s ease;
+        }
+        @keyframes slideDown { from { opacity:0; transform:translateY(-12px); } to { opacity:1; transform:translateY(0); } }
+        #selection-bar.active { display: flex; }
+        #sel-count { font-weight: 700; font-size: 0.95rem; white-space: nowrap; }
+        #sel-list-name { border: none; border-radius: 8px; padding: 7px 14px; font-size: 0.9rem; min-width: 220px; outline: none; color: #212529; }
+        .btn-create-list { background: #198754; color: white; border: none; border-radius: 8px; padding: 7px 18px; font-weight: 700; cursor: pointer; transition: background 0.2s; white-space: nowrap; }
+        .btn-create-list:hover { background: #146c43; }
+        .btn-clear-sel { background: rgba(255,255,255,0.15); color: white; border: 1px solid rgba(255,255,255,0.4); border-radius: 8px; padding: 7px 14px; font-size: 0.85rem; cursor: pointer; white-space: nowrap; }
+        .btn-clear-sel:hover { background: rgba(255,255,255,0.3); }
+
+        /* Candidate selection state */
+        .candidate-card.selected { border: 2px solid #0d6efd !important; background-color: #e7f1ff !important; }
+        .candidate-card.winner-card.selected { border: 2px solid #0d6efd !important; background-color: #d4edda !important; }
+        .sel-checkbox { cursor: pointer; width: 17px; height: 17px; accent-color: #0d6efd; flex-shrink: 0; margin-top: 3px; }
+
+        /* ===== ADVANCED CHAT STYLES ===== */
+        .chat-body { flex-grow: 1; padding: 14px; overflow-y: auto; background: linear-gradient(180deg, #f8f9fc 0%, #eef1f6 100%); display: flex; flex-direction: column; gap: 8px; direction: rtl; font-size: 0.84rem; scroll-behavior: smooth; }
+        .chat-body::-webkit-scrollbar { width: 4px; }
+        .chat-body::-webkit-scrollbar-track { background: transparent; }
+        .chat-body::-webkit-scrollbar-thumb { background: rgba(0,0,0,0.15); border-radius: 10px; }
+        .chat-body::-webkit-scrollbar-thumb:hover { background: rgba(0,0,0,0.25); }
+
+        .chat-message { max-width: 88%; padding: 10px 14px; border-radius: 16px; line-height: 1.5; animation: fadeInUp 0.3s ease-out; position: relative; font-family: 'Tajawal', 'Inter', sans-serif; }
+        .chat-message .msg-time { font-size: 0.65rem; opacity: 0.55; margin-top: 4px; display: block; font-family: 'Inter', monospace; }
+        .chat-message.bot { background: white; color: #1a1a2e; align-self: flex-start; border-bottom-right-radius: 4px; box-shadow: 0 1px 4px rgba(0,0,0,0.06); border: 1px solid rgba(0,0,0,0.04); }
+        .chat-message.user { background: linear-gradient(135deg, #667eea, #764ba2); color: white; align-self: flex-end; border-bottom-left-radius: 4px; box-shadow: 0 2px 8px rgba(102,126,234,0.3); }
+        .chat-message.user .msg-time { opacity: 0.7; }
+        .chat-message.log-success { background: linear-gradient(135deg, #e8f5e9, #c8e6c9); color: #1b5e20; align-self: stretch; max-width: 100%; border-right: 4px solid #43a047; border-radius: 10px; box-shadow: 0 1px 4px rgba(67,160,71,0.15); }
+        .chat-message.log-error { background: linear-gradient(135deg, #ffebee, #ffcdd2); color: #b71c1c; align-self: stretch; max-width: 100%; border-right: 4px solid #e53935; border-radius: 10px; box-shadow: 0 1px 4px rgba(229,57,53,0.15); }
+        .chat-message.log-info { background: linear-gradient(135deg, #e3f2fd, #bbdefb); color: #0d47a1; align-self: stretch; max-width: 100%; border-right: 4px solid #1e88e5; border-radius: 10px; box-shadow: 0 1px 4px rgba(30,136,229,0.15); }
+
+        /* Typing indicator */
+        .typing-indicator { display: flex; align-items: center; gap: 4px; padding: 12px 16px; background: white; border-radius: 16px; border-bottom-right-radius: 4px; align-self: flex-start; box-shadow: 0 1px 4px rgba(0,0,0,0.06); animation: fadeInUp 0.3s ease-out; }
+        .typing-dot { width: 7px; height: 7px; border-radius: 50%; background: #9ca3af; animation: typingBounce 1.4s infinite ease-in-out both; }
+        .typing-dot:nth-child(1) { animation-delay: -0.32s; }
+        .typing-dot:nth-child(2) { animation-delay: -0.16s; }
+
+        /* Quick actions */
+        .quick-actions { display: flex; flex-wrap: wrap; gap: 6px; padding: 8px 14px; background: rgba(248,249,252,0.95); border-top: 1px solid rgba(0,0,0,0.06); direction: rtl; flex-shrink: 0; overflow-x: auto; }
+        .quick-actions::-webkit-scrollbar { height: 0; }
+        .quick-chip { background: white; border: 1px solid #e0e3e8; color: #4a5568; padding: 5px 12px; border-radius: 20px; font-size: 0.73rem; cursor: pointer; white-space: nowrap; transition: all 0.2s ease; font-weight: 500; font-family: 'Tajawal', sans-serif; }
+        .quick-chip:hover { background: linear-gradient(135deg, #667eea, #764ba2); color: white; border-color: transparent; transform: translateY(-1px); box-shadow: 0 3px 8px rgba(102,126,234,0.3); }
+        .quick-chip .chip-icon { margin-left: 4px; }
+
+        /* Chat input area */
+        .chat-input-area { display: flex; border-top: 1px solid rgba(0,0,0,0.06); padding: 10px 12px; background: white; direction: rtl; flex-shrink: 0; border-radius: 0 0 16px 16px; gap: 8px; align-items: center; position: relative; }
+        .chat-input-wrapper { flex-grow: 1; position: relative; }
+        .chat-input-area input { width: 100%; border: 1.5px solid #e0e3e8; border-radius: 24px; padding: 9px 14px; outline: none; direction: rtl; font-size: 0.84rem; transition: all 0.2s; background: #f8f9fc; font-family: 'Tajawal', 'Inter', sans-serif; }
+        .chat-input-area input:focus { border-color: #667eea; background: white; box-shadow: 0 0 0 3px rgba(102,126,234,0.1); }
+        .chat-input-area input::placeholder { color: #adb5bd; }
+        .chat-send-btn { background: linear-gradient(135deg, #667eea, #764ba2); color: white; border: none; border-radius: 50%; width: 38px; height: 38px; min-width: 38px; cursor: pointer; font-size: 1rem; display: flex; align-items: center; justify-content: center; transition: all 0.2s; box-shadow: 0 2px 8px rgba(102,126,234,0.3); }
+        .chat-send-btn:hover { transform: scale(1.08); box-shadow: 0 4px 12px rgba(102,126,234,0.4); }
+        .chat-send-btn:active { transform: scale(0.95); }
+
+        /* Autocomplete dropdown */
+        .autocomplete-dropdown { position: absolute; bottom: 100%; right: 0; left: 0; background: white; border: 1px solid #e0e3e8; border-radius: 12px; max-height: 180px; overflow-y: auto; box-shadow: 0 -4px 16px rgba(0,0,0,0.1); z-index: 100; display: none; margin-bottom: 6px; direction: rtl; }
+        .autocomplete-dropdown.active { display: block; animation: fadeInUp 0.2s ease-out; }
+        .autocomplete-item { padding: 8px 14px; cursor: pointer; font-size: 0.82rem; border-bottom: 1px solid #f0f0f0; transition: background 0.15s; display: flex; justify-content: space-between; align-items: center; font-family: 'Tajawal', sans-serif; }
+        .autocomplete-item:last-child { border-bottom: none; }
+        .autocomplete-item:hover, .autocomplete-item.active { background: #f0f4ff; }
+        .autocomplete-item .ac-name { font-weight: 600; color: #1a1a2e; }
+        .autocomplete-item .ac-meta { font-size: 0.7rem; color: #6c757d; }
+
+        /* Welcome card */
+        .welcome-card { background: linear-gradient(135deg, rgba(102,126,234,0.08), rgba(118,75,162,0.08)); border: 1px solid rgba(102,126,234,0.15); border-radius: 12px; padding: 14px; margin-bottom: 4px; }
+        .welcome-card h6 { font-size: 0.88rem; font-weight: 700; color: #1a1a2e; margin-bottom: 8px; }
+        .welcome-card .cmd-list { list-style: none; padding: 0; margin: 0; }
+        .welcome-card .cmd-list li { font-size: 0.78rem; padding: 3px 0; color: #4a5568; cursor: pointer; transition: color 0.2s; }
+        .welcome-card .cmd-list li:hover { color: #667eea; }
+        .welcome-card .cmd-list li code { background: rgba(102,126,234,0.1); color: #667eea; padding: 1px 6px; border-radius: 4px; font-size: 0.75rem; font-family: 'Tajawal', monospace; }
+    </style>
+</head>
+<body>
+
+<div class="container-fluid px-3 py-3">
+
+<!-- STICKY SELECTION ACTION BAR -->
+<div id="selection-bar">
+    <span id="sel-count">0 candidates selected</span>
+    <input type="text" id="sel-list-name" placeholder="New list name e.g. Alliance 2026" />
+    <button class="btn-create-list" onclick="buildNewListFromSelection()">✅ Create List</button>
+    <button class="btn-clear-sel" onclick="clearSelection()">✕ Clear</button>
+</div>
+    <div class="d-flex justify-content-between align-items-center mb-4">
+        <h4 class="fw-bold mb-0">
+            {{ sub_region_name }}
+            <span class="seat-badge">{{ total_seats }} Seats</span>
+        </h4>
+        <div class="d-flex align-items-center gap-2">
+            <a href="/region/{{ region_slug }}?year=2018" class="btn btn-{{ 'primary' if current_year == '2018' else 'outline-primary' }} btn-sm fw-bold px-3">2018</a>
+            <a href="/region/{{ region_slug }}?year=2022" class="btn btn-{{ 'primary' if current_year == '2022' else 'outline-primary' }} btn-sm fw-bold px-3">2022</a>
+            <a href="/?year={{ current_year }}" class="btn btn-outline-dark btn-sm">← Back</a>
+        </div>
+    </div>
+
+    <div class="row row-cols-1 row-cols-md-2 row-cols-lg-3 g-2 mb-4" id="chartsContainer">
+        {% for district_name, charts in charts_by_district.items() %}
+            {% for chart in charts %}
+            <div class="col">
+                <div class="chart-container" id="container-{{ chart.id }}">
+                    <div class="chart-legend">
+                        <div class="legend-item"><div class="legend-box bg-winner"></div> Winner</div>
+                        <div class="legend-item"><div class="legend-box bg-loser"></div> Loser</div>
+                    </div>
+                    <div class="district-label">{{ district_name }}</div>
+                    <div class="religion-title">{{ chart.title }}</div>
+                    <div id="{{ chart.id }}" style="min-height: 120px; width: 100%;">
+                        <div class="text-muted small text-center mt-4">⏳ Loading...</div>
+                    </div>
+                </div>
+            </div>
+            {% endfor %}
+        {% endfor %}
+    </div>
+
+    <hr class="my-4">
+
+    <div class="d-flex justify-content-center mb-4 gap-3">
+        <button class="btn btn-success px-5 fw-bold" id="btnRecalc" onclick="recalcResults()">Recalculate Results</button>
+        <button class="btn btn-outline-danger px-4 fw-bold" id="btnReset" onclick="resetDefaultResults()">Reset to Default / استعادة الأصلي</button>
+    </div>
+
+    <div class="row">
+        <div class="col-lg-3 col-md-4 order-1">
+            <div class="history-card" id="chatPanel">
+                <div class="history-header">
+                    <div style="display:flex; flex-direction:column; gap:2px;">
+                        <span style="font-size:0.95rem;">🤖 المساعد الانتخابي</span>
+                        <div class="header-status">
+                            <span class="status-dot"></span>
+                            <span>متصل • جاهز للمساعدة</span>
+                        </div>
+                    </div>
+                    <div class="header-actions">
+                        <button class="header-btn" onclick="clearChatHistory()" title="مسح المحادثة">🗑️</button>
+                        <button class="header-btn" id="toggleChatBtn" onclick="toggleChatPanel()" title="تصغير / تكبير">▼</button>
+                    </div>
+                </div>
+                <div class="chat-body" id="chatBody">
+                    <div class="welcome-card">
+                        <h6>👋 مرحباً بك في المساعد الانتخابي</h6>
+                        <ul class="cmd-list">
+                            <li onclick="insertCommand('بدل')">🔄 <code>بدل X مع Y</code> — تبادل مرشحين</li>
+                            <li onclick="insertCommand('حاصل')">📊 <code>حاصل</code> — الحاصل الانتخابي</li>
+                            <li onclick="insertCommand('من فاز')">🏆 <code>من فاز</code> — عرض الفائزين</li>
+                            <li onclick="insertCommand('أصوات')">🔍 <code>أصوات [اسم]</code> — تفاصيل مرشح</li>
+                            <li onclick="insertCommand('لائحة')">📋 <code>لائحة [اسم]</code> — تفاصيل لائحة</li>
+                            <li onclick="insertCommand('قارن')">⚖️ <code>قارن X مع Y</code> — مقارنة مرشحين</li>
+                            <li onclick="insertCommand('ملخص')">📈 <code>ملخص</code> — ملخص التوزيع</li>
+                        </ul>
+                    </div>
+                </div>
+                <div class="quick-actions" id="quickActions">
+                    <span class="quick-chip" onclick="sendQuickMessage('من فاز')"><span class="chip-icon">🏆</span> الفائزون</span>
+                    <span class="quick-chip" onclick="sendQuickMessage('حاصل')"><span class="chip-icon">📊</span> الحاصل</span>
+                    <span class="quick-chip" onclick="sendQuickMessage('ملخص')"><span class="chip-icon">📈</span> ملخص</span>
+                </div>
+                <div class="chat-input-area">
+                    <div class="chat-input-wrapper">
+                        <input type="text" id="chatInput" placeholder="اكتب أمراً أو اسم مرشح..." onkeydown="handleChatKeyDown(event)" oninput="handleChatInput(event)" autocomplete="off">
+                        <div class="autocomplete-dropdown" id="acDropdown"></div>
+                    </div>
+                    <button class="chat-send-btn" onclick="sendChatMessage()" title="إرسال">➤</button>
+                </div>
+            </div>
+        </div>
+
+        <div class="col-lg-9 col-md-8 order-2">
+
+
+            
+            <h5 class="fw-bold mb-3 text-center text-md-start">Live List Standings</h5>
+            <div class="row row-cols-1 row-cols-md-2 row-cols-xl-3 g-3 pb-3" id="lists-container">
+                {% for group_name, candidates in groups.items() %}
+                {% set total_votes = candidates|sum(attribute='votes') %}
+                {% set safe_id = group_name|replace(' ', '_')|replace('.', '') %}
+
+                <div class="col">
+                    <div class="card border-0">
+                        <div class="list-header d-flex justify-content-between align-items-center flex-wrap">
+                            <div class="text-truncate" style="max-width: 75%;">{{ group_name }}</div>
+                            <span class="badge bg-white text-primary" id="total-{{ safe_id }}">{{ total_votes }}</span>
+                        </div>
+                        <div class="sortable-list" id="list-{{ safe_id }}" data-group="{{ group_name }}">
+                            {% for c in candidates %}
+                            <div class="candidate-card {{ 'winner-card' if c.is_winner else 'loser-card' }}" data-name="{{ c.name }}" data-votes="{{ c.votes }}" data-religion="{{ c.religion }}">
+                                <div class="d-flex justify-content-between align-items-center">
+                                    <div class="text-truncate d-flex align-items-start gap-2">
+                                        <input type="checkbox" class="sel-checkbox mt-1"
+                                            title="Select for new list"
+                                            onchange="toggleCandidateSelection(this, '{{ c.name }}')">
+                                        <div>
+                                            <div class="fw-bold">{{ c.name }}</div>
+                                            <div class="small opacity-75" style="font-size: 0.7rem;">{{ c.religion }} . {{ c.district }}</div>
+                                            {% if c.is_winner %}<span class="badge-winner">WINNER</span>{% endif %}
+                                        </div>
+                                    </div>
+                                    <div class="text-end"><span class="fw-bold">{{ c.votes }}</span></div>
+                                </div>
+                            </div>
+                            {% endfor %}
+                        </div>
+                    </div>
+                </div>
+                {% endfor %}
+            </div>
+
+            <div class="card shadow-sm border-0 mb-5">
+                <div class="card-header bg-dark text-white text-end" style="direction: rtl;">
+                    <h6 class="mb-0 fw-bold">📊 حاسبة الأصوات وتبادلات المقاعد</h6>
+                </div>
+                <div class="card-body" style="direction: rtl; text-align: right;">
+                    <p class="text-muted small mb-3">اختر لائحة لمعرفة عدد الأصوات التقريبية التي تحتاجها للوصول إلى الحاصل الانتخابي أو الفوز بمقاعد إضافية.</p>
+                    <div class="row align-items-start">
+                        <div class="col-md-5 mb-3 mb-md-0">
+                            <select id="listSelector" class="form-select fw-bold border-primary text-primary shadow-sm mb-2" onchange="updateVotesNeededDisplay()">
+                                <option value="" disabled selected>-- اختر اللائحة --</option>
+                                {% for group_name in groups.keys() %}
+                                <option value="{{ group_name }}">{{ group_name }}</option>
+                                {% endfor %}
+                            </select>
+                            <select id="seatTargetSelector" class="form-select shadow-sm" onchange="updateVotesNeededDisplay()">
+                                <option value="1" selected>+1 مقعد إضافي (أو للوصول للحاصل)</option>
+                                <option value="2">+2 مقعدين إضافيين</option>
+                                <option value="3">+3 مقاعد إضافية</option>
+                            </select>
+                        </div>
+                        <div class="col-md-7">
+                            <div id="votesNeededResult" class="p-3 border rounded bg-light" style="display: none;"></div>
+                        </div>
+                    </div>
+                </div>
+            </div>
+
+            <div class="card shadow-sm border-0 mb-5">
+                <div class="card-header bg-success text-white text-end" style="direction: rtl;">
+                    <h6 class="mb-0 fw-bold">🎯 مستشار الفوز — في أي لائحة يفوز هذا المرشح؟</h6>
+                </div>
+                <div class="card-body" style="direction: rtl; text-align: right;">
+                    <p class="text-muted small mb-3">اختر مرشحاً لمعرفة في أي لائحة يمكنه الفوز.</p>
+                    <div class="row align-items-start">
+                        <div class="col-md-5 mb-3 mb-md-0">
+                            <select id="candidateAdvisor" class="form-select fw-bold border-success text-success shadow-sm" onchange="findWinningList()">
+                                <option value="" disabled selected>-- اختر المرشح --</option>
+                                {% for cname in all_candidates %}
+                                <option value="{{ cname }}">{{ cname }}</option>
+                                {% endfor %}
+                            </select>
+                        </div>
+                        <div class="col-md-7">
+                            <div id="advisorResult" class="p-3 border rounded bg-light" style="display: none;"></div>
+                        </div>
+                    </div>
+                </div>
+            </div>
+
+        </div>
+    </div>
+</div>
+
+
+
+<script>
+    const filename = "{{ file_id }}";
+
+    // =============================================
+    // NEW LIST BUILDER — SELECTION LOGIC
+    // =============================================
+    const selectedCandidates = new Set();
+
+    function toggleCandidateSelection(checkbox, name) {
+        const card = checkbox.closest('.candidate-card');
+        if (checkbox.checked) {
+            selectedCandidates.add(name);
+            card.classList.add('selected');
+        } else {
+            selectedCandidates.delete(name);
+            card.classList.remove('selected');
+        }
+        updateSelectionBar();
+    }
+
+    function updateSelectionBar() {
+        const bar = document.getElementById('selection-bar');
+        const countEl = document.getElementById('sel-count');
+        const n = selectedCandidates.size;
+        if (n > 0) {
+            bar.classList.add('active');
+            countEl.textContent = `${n} candidate${n > 1 ? 's' : ''} selected`;
+        } else {
+            bar.classList.remove('active');
+        }
+    }
+
+    function clearSelection() {
+        selectedCandidates.clear();
+        document.querySelectorAll('.sel-checkbox').forEach(cb => {
+            cb.checked = false;
+            cb.closest('.candidate-card').classList.remove('selected');
+        });
+        document.getElementById('sel-list-name').value = '';
+        updateSelectionBar();
+    }
+
+    async function buildNewListFromSelection() {
+        const listName = document.getElementById('sel-list-name').value.trim();
+        if (!listName) {
+            document.getElementById('sel-list-name').focus();
+            document.getElementById('sel-list-name').style.outline = '2px solid #ff0000';
+            setTimeout(() => document.getElementById('sel-list-name').style.outline = '', 1500);
+            return;
+        }
+        if (selectedCandidates.size === 0) return;
+
+        const btn = document.querySelector('.btn-create-list');
+        btn.disabled = true;
+        btn.textContent = '⏳ Creating...';
+
+        let successCount = 0;
+        for (const candidateName of selectedCandidates) {
+            try {
+                const res = await fetch('/api/change_candidate_group', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ filename: filename, candidate_name: candidateName, new_group: listName })
+                });
+                const data = await res.json();
+                if (data.success) successCount++;
+            } catch (e) { /* continue */ }
+        }
+
+        if (successCount > 0) {
+            addLogMessage(`<strong>✨ New List Created:</strong> "<b>${listName}</b>" — moved <b>${successCount}</b> candidate${successCount > 1 ? 's' : ''}.`, 'log-success');
+            // Reload so the new list column appears with correct totals & winner badges
+            window.location.reload();
+        } else {
+            btn.disabled = false;
+            btn.textContent = '✅ Create List';
+            addLogMessage('<strong>❌ Error:</strong> Could not move candidates. Please try again.', 'log-error');
+        }
+    }
+    const chartData = {}; 
+
+    window.addEventListener('DOMContentLoaded', function() {
+        restoreChatHistory();
+        {% for district_name, charts in charts_by_district.items() %}
+            {% for chart in charts %}
+                (function() {
+                    const chartId = "{{ chart.id }}";
+                    const initialPlot = {{ chart.json_initial | safe }};
+                    const fullPlot = {{ chart.json_full | safe }};
+                    
+                    const el = document.getElementById(chartId);
+                    if (el) {
+                        el.innerHTML = ''; 
+                        Plotly.newPlot(el, initialPlot.data, initialPlot.layout, { responsive: true, displayModeBar: false });
+                        chartData[chartId] = { initial: initialPlot, full: fullPlot, state: 'initial' };
+
+                        {% if chart.has_more %}
+                            const container = document.getElementById('container-' + chartId);
+                            const btn = document.createElement('button');
+                            btn.id = 'btn-' + chartId;
+                            btn.className = 'btn btn-outline-primary btn-seemore';
+                            btn.innerText = 'See All';
+                            btn.onclick = () => toggleExpand(chartId);
+                            container.appendChild(btn);
+                        {% endif %}
+                    }
+                })();
+            {% endfor %}
+        {% endfor %}
+    });
+
+    function toggleExpand(chartId) {
+        const btn = document.getElementById('btn-' + chartId);
+        const cd = chartData[chartId];
+        if (!cd) return;
+        const isExpanding = (cd.state === 'initial');
+        cd.state = isExpanding ? 'full' : 'initial';
+        const activePlot = isExpanding ? cd.full : cd.initial;
+        btn.innerText = isExpanding ? "Collapse" : "See All";
+        Plotly.react(chartId, activePlot.data, activePlot.layout, { responsive: true, displayModeBar: false });
+    }
+
+    // --- UTILITY & LOGGING (into chatBody, persisted) ---
+    const CHAT_STORAGE_KEY = 'chat_history_' + filename;
+
+    function saveChatHistory() {
+        const chatBody = document.getElementById('chatBody');
+        localStorage.setItem(CHAT_STORAGE_KEY, chatBody.innerHTML);
+    }
+
+    function restoreChatHistory() {
+        const saved = localStorage.getItem(CHAT_STORAGE_KEY);
+        if (saved) {
+            document.getElementById('chatBody').innerHTML = saved;
+            const chatBody = document.getElementById('chatBody');
+            chatBody.scrollTop = chatBody.scrollHeight;
+        }
+    }
+
+    function addLogMessage(htmlMessage, typeClass) {
+        const chatBody = document.getElementById('chatBody');
+        const entry = document.createElement('div');
+        entry.className = 'chat-message ' + typeClass;
+        const now = new Date();
+        const timeStr = now.getHours().toString().padStart(2, '0') + ":" + now.getMinutes().toString().padStart(2, '0') + ":" + now.getSeconds().toString().padStart(2, '0');
+        entry.innerHTML = `<div style="font-size: 0.7rem; color: #6c757d; margin-bottom: 3px;">[${timeStr}]</div>${htmlMessage}`;
+        chatBody.appendChild(entry);
+        chatBody.scrollTop = chatBody.scrollHeight;
+        saveChatHistory();
+    }
+
+    // --- VIRTUAL LIST BUILDER LOGIC ---
+    let virtualList = [];
+
+    function addToVirtualList(name, votes, rel) {
+        if (virtualList.find(x => x.name === name)) return;
+        virtualList.push({name, votes, rel});
+        renderVirtualList();
+    }
+
+    function renderVirtualList() {
+        const container = document.getElementById("virtual-container");
+        if (virtualList.length === 0) {
+            container.innerHTML = '<span class="text-muted small">Click the <b>+</b> on candidate cards below to test if a custom alliance reaches the electoral quotient.</span>';
+            return;
+        }
+        container.innerHTML = virtualList.map(c => `
+            <div class="badge bg-white text-dark border p-2 shadow-sm d-flex align-items-center gap-2">
+                <div><b>${c.name}</b> <br> <span class="fw-normal text-muted">${c.votes.toLocaleString()} votes</span></div>
+                <span class="text-danger fs-5" style="cursor:pointer" onclick="removeFromVirtual('${c.name}')">&times;</span>
+            </div>
+        `).join('');
+    }
+
+    function removeFromVirtual(name) {
+        virtualList = virtualList.filter(x => x.name !== name);
+        renderVirtualList();
+    }
+
+    function clearVirtualList() { 
+        virtualList = []; 
+        renderVirtualList(); 
+    }
+
+    async function analyzeVirtualList() {
+        if (virtualList.length === 0) return;
+        const res = await fetch("/api/analyze_virtual_list", {
+            method: "POST", headers: {"Content-Type": "application/json"},
+            body: JSON.stringify({ filename, candidates: virtualList })
+        });
+        const data = await res.json();
+        const status = data.reaches_quotient ? '✅ Hit Quotient' : '❌ Failed Quotient';
+        addLogMessage(`<strong>${status}:</strong> Virtual List total is <b>${data.total_votes.toLocaleString()}</b>. Needed <b>${data.quotient.toLocaleString()}</b>.`, data.reaches_quotient ? 'log-success' : 'log-info');
+    }
+
+    // --- WINNING LIST ADVISOR ---
+    async function findWinningList() {
+        const candidateName = document.getElementById("candidateAdvisor").value;
+        const resultBox = document.getElementById("advisorResult");
+        if (!candidateName) { resultBox.style.display = "none"; return; }
+
+        resultBox.style.display = "block";
+        resultBox.innerHTML = `<div class="text-muted">⏳ جاري التحليل...</div>`;
+
+        try {
+            const res = await fetch("/api/find_winning_list", {
+                method: "POST", headers: {"Content-Type": "application/json"},
+                body: JSON.stringify({ filename: filename, candidate_name: candidateName })
+            });
+            const data = await res.json();
+
+            if (!data.success) {
+                resultBox.innerHTML = `<div class="text-danger">${data.message}</div>`;
+                return;
+            }
+
+            let html = `<div class="mb-2"><b>${data.candidate}</b> — ${data.religion} . ${data.district} — <b>${data.votes.toLocaleString()}</b> صوت</div>`;
+            html += `<div class="mb-2">اللائحة الحالية: <b>${data.current_group}</b> — ${data.currently_winner ? '🏆 فائز حالياً' : '❌ خاسر حالياً'}</div><hr class="my-2">`;
+
+            const winning = data.results.filter(r => r.wins);
+            const losing = data.results.filter(r => !r.wins);
+
+            if (winning.length === 0) {
+                html += `<div class="text-danger fw-bold">⚠️ لا يوجد لائحة يفوز فيها هذا المرشح حالياً.</div>`;
+            } else {
+                html += `<div class="fw-bold text-success mb-2">✅ يفوز في (${winning.length}) لائحة:</div>`;
+                winning.forEach(r => {
+                    const badge = r.is_current ? ' <span class="badge bg-secondary">الحالية</span>' : '';
+                    html += `<div class="d-flex justify-content-between align-items-center py-1 px-2 mb-1 rounded" style="background:#e8f5e9;">
+                        <span><b>${r.group}</b>${badge}</span>
+                        <span class="text-muted small">${r.total_votes.toLocaleString()} صوت</span>
+                    </div>`;
+                });
+            }
+
+            if (losing.length > 0) {
+                html += `<div class="fw-bold text-muted mt-2 mb-2">❌ لا يفوز في (${losing.length}) لائحة:</div>`;
+                losing.forEach(r => {
+                    const badge = r.is_current ? ' <span class="badge bg-secondary">الحالية</span>' : '';
+                    html += `<div class="d-flex justify-content-between align-items-center py-1 px-2 mb-1 rounded" style="background:#f5f5f5;">
+                        <span class="text-muted">${r.group}${badge}</span>
+                        <span class="text-muted small">${r.total_votes.toLocaleString()} صوت</span>
+                    </div>`;
+                });
+            }
+
+            resultBox.innerHTML = html;
+        } catch (e) {
+            resultBox.innerHTML = `<div class="text-danger">فشل الاتصال بالخادم.</div>`;
+        }
+    }
+
+    // --- DRAG AND DROP / SWAP LOGIC ---
+    async function handleDrop(evt) {
+        if (evt.to === evt.from && evt.oldIndex === evt.newIndex) return;
+
+        const candidateName = evt.item.dataset.name;
+        const newGroup = evt.to.dataset.group;
+        const oldGroup = evt.from.dataset.group;
+
+        // If swapped with another candidate (swap plugin puts it in evt.swapItem)
+        const swapItem = evt.swapItem;
+
+        if (swapItem && oldGroup !== newGroup) {
+            // True swap: exchange candidates (must match religion + district)
+            const targetName = swapItem.dataset.name;
+            try {
+                const res = await fetch('/api/swap_candidates', {
+                    method: 'POST', headers: {'Content-Type': 'application/json'},
+                    body: JSON.stringify({ filename: filename, candidate_name: candidateName, target_name: targetName })
+                });
+                const data = await res.json();
+
+                if (data.success) {
+                    addLogMessage(`<strong>🔄 تبادل:</strong> تم تبديل <b>${data.src_name}</b> مع <b>${data.target_name}</b>.`, 'log-success');
+
+                    if (document.getElementById('total-' + data.src_group_id)) {
+                        document.getElementById('total-' + data.src_group_id).innerText = data.src_total.toLocaleString();
+                    }
+                    if (document.getElementById('total-' + data.target_group_id)) {
+                        document.getElementById('total-' + data.target_group_id).innerText = data.target_total.toLocaleString();
+                    }
+                    currentVotesNeeded = {};
+                } else {
+                    // Revert the DOM swap: put each card back in its original list
+                    evt.from.insertBefore(evt.item, evt.from.children[evt.oldIndex] || null);
+                    evt.to.insertBefore(swapItem, evt.to.children[evt.newIndex] || null);
+                    addLogMessage(`<strong>❌ رفض:</strong> ${data.message || 'لا يمكن التبادل لاختلاف الطائفة أو الدائرة.'}`, 'log-error');
+                }
+            } catch (e) {
+                evt.from.insertBefore(evt.item, evt.from.children[evt.oldIndex] || null);
+                evt.to.insertBefore(swapItem, evt.to.children[evt.newIndex] || null);
+                addLogMessage('<strong>❌ خطأ:</strong> فشل الاتصال بالخادم.', 'log-error');
+            }
+        } else if (oldGroup !== newGroup) {
+            // Simple move (no swap partner, e.g. dropped into empty space)
+            try {
+                const res = await fetch('/api/change_candidate_group', {
+                    method: 'POST', headers: {'Content-Type': 'application/json'},
+                    body: JSON.stringify({ filename: filename, candidate_name: candidateName, new_group: newGroup })
+                });
+                const data = await res.json();
+
+                if (data.success) {
+                    addLogMessage(`<strong>🔄 نقل:</strong> تم نقل <b>${data.candidate}</b> إلى <b>${data.new_group}</b>.`, 'log-success');
+                    const oldSafeId = data.old_group.replace(/[\s\.]/g, '_');
+                    const newSafeId = data.new_group.replace(/[\s\.]/g, '_');
+                    if (document.getElementById('total-' + oldSafeId)) {
+                        document.getElementById('total-' + oldSafeId).innerText = data.old_total.toLocaleString();
+                    }
+                    if (document.getElementById('total-' + newSafeId)) {
+                        document.getElementById('total-' + newSafeId).innerText = data.new_total.toLocaleString();
+                    }
+                    currentVotesNeeded = {};
+                } else {
+                    addLogMessage(`<strong>❌ خطأ:</strong> ${data.message}`, 'log-error');
+                }
+            } catch (e) {
+                addLogMessage('<strong>❌ خطأ:</strong> فشل الاتصال بالخادم.', 'log-error');
+            }
+        }
+    }
+
+    document.querySelectorAll('.sortable-list').forEach(el => {
+        new Sortable(el, { group: 'shared', animation: 150, swap: true, swapClass: 'selected', onEnd: handleDrop });
+    });
+
+    function addNewList() {
+        const input = document.getElementById('newListName');
+        const listName = input.value.trim();
+        if (!listName) return;
+
+        const safeId = listName.replace(/[\s\.]/g, '_');
+        if (document.getElementById('list-' + safeId)) {
+            alert('لائحة بهذا الاسم موجودة مسبقاً!');
+            return;
+        }
+
+        const container = document.getElementById('lists-container');
+        const col = document.createElement('div');
+        col.className = 'col';
+        
+        col.innerHTML = `
+            <div class="card border-primary shadow-sm">
+                <div class="list-header d-flex justify-content-between align-items-center" style="background-color: #0dcaf0; color: #000;">
+                    <div class="text-truncate fw-bold">${listName}</div>
+                    <span class="badge bg-white text-dark" id="total-${safeId}">0</span>
+                </div>
+                <div class="sortable-list bg-light" id="list-${safeId}" data-group="${listName}"></div>
+            </div>
+        `;
+        
+        container.insertBefore(col, container.firstChild);
+        new Sortable(document.getElementById('list-' + safeId), { group: 'shared', animation: 150, swap: true, swapClass: 'selected', onEnd: handleDrop });
+        
+        input.value = '';
+        addLogMessage(`<strong>✨ لائحة جديدة:</strong> تم إنشاء <b>${listName}</b> بنجاح.`, 'log-info');
+    }
+
+    // --- QUOTA CALCULATOR LOGIC ---
+    let currentVotesNeeded = {};
+    async function updateVotesNeededDisplay() {
+        const listName = document.getElementById("listSelector").value;
+        const targetK = document.getElementById("seatTargetSelector").value;
+        const resultBox = document.getElementById("votesNeededResult");
+
+        if (!listName) { resultBox.style.display = "none"; return; }
+
+        const cacheKey = `${listName}__${targetK}`;
+        if (!currentVotesNeeded[cacheKey]) {
+            resultBox.style.display = "block";
+            resultBox.innerHTML = `<div class="text-muted">جاري احتساب الاقتراحات...</div>`;
+
+            try {
+                const res = await fetch("/api/get_votes_needed", {
+                    method: "POST", headers: {"Content-Type": "application/json"},
+                    body: JSON.stringify({ filename: filename, group_name: listName, target_k: targetK })
+                });
+                const data = await res.json();
+
+                if (!data.success || !data.result) {
+                    resultBox.innerHTML = `<div class="text-danger">تعذر احتساب النتائج لهذه اللائحة.</div>`;
+                    return;
+                }
+                currentVotesNeeded[cacheKey] = data.result;
+            } catch (e) {
+                resultBox.innerHTML = `<div class="text-danger">فشل الاتصال بالخادم.</div>`;
+                return;
+            }
+        }
+
+        const listData = currentVotesNeeded[cacheKey];
+        let typeText = `للفوز بـ ${targetK} مقعد إضافي`;
+        if (!listData.passed && targetK === "1") typeText = "للوصول إلى الحاصل الأول";
+
+        let html = `
+            <div class="mb-3">
+                تحتاج هذه اللائحة إلى <strong class="fs-4 text-primary">${listData.votes.toLocaleString()}</strong> صوت تقريباً
+                <span class="badge bg-info ms-2">${typeText}</span>
+            </div>
+        `;
+
+        if (listData.suggestions && listData.suggestions.length > 0) {
+            html += `<hr class="my-2"><p class="small text-muted mb-2 mt-2"><i class="fw-bold text-success">💡 تبادلات مقترحة:</i></p>`;
+            listData.suggestions.forEach((suggestion, idx) => {
+                const encodedSwaps = encodeURIComponent(JSON.stringify(suggestion.swaps));
+                html += `
+                    <div class="card mb-2 shadow-sm">
+                        <div class="card-body py-2 px-3">
+                            <div class="d-flex justify-content-between align-items-center mb-2 flex-wrap gap-2">
+                                <div><b>الخيار ${idx + 1}</b> <span class="badge bg-success ms-2">+${suggestion.total_gain.toLocaleString()} صوت</span></div>
+                                <button class="btn btn-sm btn-primary" onclick="executeMultiSwapFromEncoded('${encodedSwaps}')">تنفيذ</button>
+                            </div>
+                            <ul class="list-group">
+                `;
+                suggestion.swaps.forEach(sw => {
+                    html += `
+                        <li class="list-group-item d-flex justify-content-between align-items-center" style="font-size:0.85rem;">
+                            <span>أخرج <b>${sw.out}</b> وأدخل <b>${sw.in}</b> <span class="text-muted">(${sw.religion})</span></span>
+                            <span class="badge bg-success rounded-pill">+${sw.net_gain.toLocaleString()}</span>
+                        </li>
+                    `;
+                });
+                html += `</ul></div></div>`;
+            });
+        } else {
+            html += `<hr class="my-2"><div class="text-muted small mt-2">لا توجد اقتراحات مناسبة لهذا الهدف.</div>`;
+        }
+
+        resultBox.style.display = "block";
+        resultBox.innerHTML = html;
+    }
+
+    function executeMultiSwapFromEncoded(encoded) {
+        try { executeMultiSwap(JSON.parse(decodeURIComponent(encoded))); } catch (e) { }
+    }
+
+    async function executeMultiSwap(swaps) {
+        if (!swaps || !swaps.length) return;
+        try {
+            const res = await fetch('/api/multi_swap_candidates', {
+                method: 'POST', headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ filename: filename, swaps: swaps })
+            });
+            const data = await res.json();
+
+            if (data.success) {
+                currentVotesNeeded = {};
+                addLogMessage(`<strong>🔄 Multi-swap:</strong> تم تنفيذ ${swaps.length} تبديلات بنجاح.`, 'log-success');
+                recalcResults();
+            }
+        } catch (e) { }
+    }
+
+    // --- ADVANCED CHATBOT ---
+    const allCandidateNames = {{ all_candidates | tojson }};
+    let acIndex = -1;
+
+    function getTimeStr() {
+        const now = new Date();
+        return now.getHours().toString().padStart(2,'0') + ':' + now.getMinutes().toString().padStart(2,'0');
+    }
+
+    function handleChatKeyDown(e) {
+        const dropdown = document.getElementById('acDropdown');
+        const items = dropdown.querySelectorAll('.autocomplete-item');
+        if (dropdown.classList.contains('active') && items.length > 0) {
+            if (e.key === 'ArrowDown') { e.preventDefault(); acIndex = Math.min(acIndex + 1, items.length - 1); updateAcHighlight(items); return; }
+            if (e.key === 'ArrowUp') { e.preventDefault(); acIndex = Math.max(acIndex - 1, 0); updateAcHighlight(items); return; }
+            if (e.key === 'Enter' && acIndex >= 0) { e.preventDefault(); selectAcItem(items[acIndex].dataset.name); return; }
+        }
+        if (e.key === 'Enter') { e.preventDefault(); sendChatMessage(); }
+    }
+
+    function handleChatInput(e) {
+        const val = e.target.value.trim();
+        const dropdown = document.getElementById('acDropdown');
+        acIndex = -1;
+        if (val.length < 2) { dropdown.classList.remove('active'); return; }
+        // Extract the last word/phrase for matching
+        const words = val.split(/\s+/);
+        const lastPart = words.slice(-2).join(' ');
+        if (lastPart.length < 2) { dropdown.classList.remove('active'); return; }
+        const matches = allCandidateNames.filter(n => n.includes(lastPart) || lastPart.includes(n.split(' ')[0])).slice(0, 6);
+        if (matches.length === 0) { dropdown.classList.remove('active'); return; }
+        dropdown.innerHTML = matches.map(n => {
+            return `<div class="autocomplete-item" data-name="${n}" onclick="selectAcItem('${n.replace(/'/g, "\\'")}')">
+                <span class="ac-name">${n}</span>
+            </div>`;
+        }).join('');
+        dropdown.classList.add('active');
+    }
+
+    function updateAcHighlight(items) {
+        items.forEach((it, i) => it.classList.toggle('active', i === acIndex));
+    }
+
+    function selectAcItem(name) {
+        const input = document.getElementById('chatInput');
+        const val = input.value;
+        // Replace the last partial word with the full name
+        const words = val.split(/\s+/);
+        // Find how many trailing words match
+        let replaced = false;
+        for (let i = Math.max(0, words.length - 3); i < words.length; i++) {
+            const tail = words.slice(i).join(' ');
+            if (name.includes(tail) || tail.length >= 2) {
+                words.splice(i, words.length - i, name);
+                replaced = true;
+                break;
+            }
+        }
+        if (!replaced) words.push(name);
+        input.value = words.join(' ');
+        document.getElementById('acDropdown').classList.remove('active');
+        acIndex = -1;
+        input.focus();
+    }
+
+    function insertCommand(cmd) {
+        const input = document.getElementById('chatInput');
+        input.value = cmd + ' ';
+        input.focus();
+    }
+
+    function sendQuickMessage(msg) {
+        document.getElementById('chatInput').value = msg;
+        sendChatMessage();
+    }
+
+    function toggleChatPanel() {
+        const panel = document.getElementById('chatPanel');
+        const btn = document.getElementById('toggleChatBtn');
+        panel.classList.toggle('collapsed');
+        btn.textContent = panel.classList.contains('collapsed') ? '▲' : '▼';
+    }
+
+    function clearChatHistory() {
+        if (!confirm('مسح جميع الرسائل؟')) return;
+        const chatBody = document.getElementById('chatBody');
+        chatBody.innerHTML = `<div class="welcome-card">
+            <h6>👋 مرحباً بك في المساعد الانتخابي</h6>
+            <ul class="cmd-list">
+                <li onclick="insertCommand('بدل')">🔄 <code>بدل X مع Y</code> — تبادل مرشحين</li>
+                <li onclick="insertCommand('حاصل')">📊 <code>حاصل</code> — الحاصل الانتخابي</li>
+                <li onclick="insertCommand('من فاز')">🏆 <code>من فاز</code> — عرض الفائزين</li>
+                <li onclick="insertCommand('أصوات')">🔍 <code>أصوات [اسم]</code> — تفاصيل مرشح</li>
+                <li onclick="insertCommand('لائحة')">📋 <code>لائحة [اسم]</code> — تفاصيل لائحة</li>
+                <li onclick="insertCommand('قارن')">⚖️ <code>قارن X مع Y</code> — مقارنة مرشحين</li>
+                <li onclick="insertCommand('ملخص')">📈 <code>ملخص</code> — ملخص التوزيع</li>
+            </ul>
+        </div>`;
+        localStorage.removeItem(CHAT_STORAGE_KEY);
+    }
+
+    function appendMessage(text, sender) {
+        const chatBody = document.getElementById("chatBody");
+        const msgDiv = document.createElement("div");
+        msgDiv.className = `chat-message ${sender}`;
+        msgDiv.innerHTML = text + `<span class="msg-time">${getTimeStr()}</span>`;
+        chatBody.appendChild(msgDiv);
+        chatBody.scrollTop = chatBody.scrollHeight;
+        saveChatHistory();
+    }
+
+    function showTypingIndicator() {
+        const chatBody = document.getElementById("chatBody");
+        const typingId = 'typing-' + Date.now();
+        chatBody.insertAdjacentHTML('beforeend', `<div id="${typingId}" class="typing-indicator"><span class="typing-dot"></span><span class="typing-dot"></span><span class="typing-dot"></span></div>`);
+        chatBody.scrollTop = chatBody.scrollHeight;
+        return typingId;
+    }
+
+    async function sendChatMessage() {
+        const input = document.getElementById("chatInput");
+        const text = input.value.trim();
+        if (!text) return;
+        // Close autocomplete
+        document.getElementById('acDropdown').classList.remove('active');
+        acIndex = -1;
+        
+        appendMessage(text, "user");
+        input.value = "";
+        
+        const typingId = showTypingIndicator();
+
+        try {
+            const res = await fetch("/api/chat", {
+                method: "POST", headers: {"Content-Type": "application/json"},
+                body: JSON.stringify({ message: text, filename: filename })
+            });
+            const data = await res.json();
+            document.getElementById(typingId)?.remove();
+            appendMessage(data.reply, "bot");
+            if (data.action === 'swap_done') {
+                setTimeout(() => window.location.reload(), 1500);
+            }
+        } catch (e) {
+            document.getElementById(typingId)?.remove();
+            appendMessage("عذراً، حدث خطأ في الاتصال بالخادم.", "bot");
+        }
+    }
+
+    // Close autocomplete on outside click
+    document.addEventListener('click', function(e) {
+        if (!e.target.closest('.chat-input-wrapper')) {
+            document.getElementById('acDropdown').classList.remove('active');
+        }
+    });
+
+    // --- RECALCULATE LOGIC ---
+    async function recalcResults() {
+        const btn = document.getElementById("btnRecalc");
+        btn.disabled = true;
+        btn.innerText = "Recalculating...";
+        addLogMessage(`<strong>⏳ جاري الحساب:</strong> يتم الآن تحديث النتائج والمقاعد...`, 'log-info');
+
+        try {
+            const res = await fetch("/api/recompute_results", {
+                method: "POST", headers: {"Content-Type": "application/json"},
+                body: JSON.stringify({ filename: filename })
+            });
+            const data = await res.json();
+            if (data.success) {
+                const newWinners = new Set(data.winner_names || []);
+
+                // Get previous winners from DOM (cards with winner-card class)
+                const oldWinners = new Set();
+                document.querySelectorAll('.candidate-card.winner-card').forEach(card => {
+                    oldWinners.add(card.dataset.name);
+                });
+
+                // Find changes only
+                const newlyWon = [...newWinners].filter(n => !oldWinners.has(n));
+                const newlyLost = [...oldWinners].filter(n => !newWinners.has(n));
+
+                if (newlyWon.length === 0 && newlyLost.length === 0) {
+                    addLogMessage(`<strong>📊 إعادة الحساب:</strong> لا تغييرات — النتائج كما هي.`, 'log-info');
+                } else {
+                    let html = `<strong>📊 تغييرات النتائج</strong><hr style="margin:6px 0; border-color:#ccc;">`;
+                    newlyWon.forEach(n => {
+                        html += `<span style="color:#1b5e20;">🆕✅ <b>${n}</b> — فاز</span><br>`;
+                    });
+                    newlyLost.forEach(n => {
+                        html += `<span style="color:#b71c1c;">🔻❌ <b>${n}</b> — خسر</span><br>`;
+                    });
+                    addLogMessage(html, 'log-info');
+                }
+
+                setTimeout(() => window.location.reload(), 100);
+            }
+        } catch (e) {
+            btn.disabled = false;
+            btn.innerText = "Recalculate Results";
+            addLogMessage('<strong>❌ خطأ:</strong> فشل إعادة الحساب.', 'log-error');
+        }
+    }
+
+    async function resetDefaultResults() {
+        if (!confirm("Are you sure you want to discard all changes?")) return;
+        const btn = document.getElementById("btnReset");
+        btn.disabled = true; btn.innerText = "Resetting...";
+        try {
+            const res = await fetch("/api/reset_results", {
+                method: "POST", headers: {"Content-Type": "application/json"},
+                body: JSON.stringify({ filename: filename })
+            });
+            const data = await res.json();
+            if (data.success) { localStorage.removeItem(CHAT_STORAGE_KEY); window.location.reload(); }
+        } catch (e) {
+            btn.disabled = false; btn.innerText = "Reset to Default";
+        }
+    }
+</script>
+</body>
+</html>
