@@ -1,10 +1,13 @@
-from flask import Flask, render_template, abort, request, jsonify
+from flask import Flask, render_template, abort, request, jsonify, send_file
 import pandas as pd
 import json
 import os
 import re
 import math
 import difflib
+from io import BytesIO
+from datetime import datetime
+from sqlalchemy import create_engine, text
 import geopandas as gpd
 import plotly.express as px
 import plotly
@@ -57,6 +60,17 @@ YEAR_DIRS = {
     "2022": os.path.join(BASE_DIR, "2022"),
 }
 
+
+# --- POSTGRESQL SETUP ---
+# The application now reads election result data from PostgreSQL.
+# Set DATABASE_URL in your terminal, or keep the default local database below.
+DATABASE_URL = os.environ.get(
+    "DATABASE_URL",
+    "postgresql+psycopg2://postgres:lims@localhost:5432/election_db"
+)
+DB_ENGINE = create_engine(DATABASE_URL, pool_pre_ping=True)
+
+
 # =========================================================
 #  HELPER FUNCTIONS
 # =========================================================
@@ -88,6 +102,63 @@ def district_files(year: str, district_code: str) -> dict:
         "seats": os.path.join(root, f"{district_code}_seats.xlsx"),
         "data": os.path.join(root, f"{district_code}_data.xlsx"),
     }
+
+
+def database_has_district(year: str, district_code: str) -> bool:
+    """Return True when the selected year/district exists in PostgreSQL."""
+    try:
+        with DB_ENGINE.connect() as conn:
+            q = text("""
+                SELECT
+                    (SELECT COUNT(*) FROM election_members WHERE year = :year AND district_code = :district_code) AS members_count,
+                    (SELECT COUNT(*) FROM election_votes   WHERE year = :year AND district_code = :district_code) AS votes_count,
+                    (SELECT COUNT(*) FROM election_seats   WHERE year = :year AND district_code = :district_code) AS seats_count
+            """)
+            row = conn.execute(q, {"year": int(year), "district_code": district_code}).mappings().first()
+            return bool(row and row["members_count"] > 0 and row["votes_count"] > 0 and row["seats_count"] > 0)
+    except Exception as e:
+        print(f"❌ Database check failed for {year}:{district_code}: {e}")
+        return False
+
+
+def load_tables_from_database(year: str, district_code: str):
+    """Load seats, members, and votes from PostgreSQL and return DataFrames using the old column names."""
+    params = {"year": int(year), "district_code": district_code}
+    try:
+        with DB_ENGINE.connect() as conn:
+            seats_df = pd.read_sql(text("""
+                SELECT district AS "DISTRICT", religion AS "RELIGION"
+                FROM election_seats
+                WHERE year = :year AND district_code = :district_code
+                ORDER BY id
+            """), conn, params=params)
+
+            members_df = pd.read_sql(text("""
+                SELECT
+                    candidate_id AS "CANDIDATE_ID",
+                    member AS "MEMBER",
+                    group_name AS "GROUP",
+                    religion AS "RELIGION",
+                    district AS "DISTRICT"
+                FROM election_members
+                WHERE year = :year AND district_code = :district_code
+                ORDER BY id
+            """), conn, params=params)
+
+            data_df = pd.read_sql(text("""
+                SELECT
+                    candidate_id AS "CANDIDATE_ID",
+                    member AS "MEMBER",
+                    SUM(votes)::int AS "VOTES"
+                FROM election_votes
+                WHERE year = :year AND district_code = :district_code
+                GROUP BY candidate_id, member
+            """), conn, params=params)
+
+        return seats_df, members_df, data_df
+    except Exception as e:
+        print(f"❌ Database load failed for {year}:{district_code}: {e}")
+        return None, None, None
 
 def _std_cols(df: pd.DataFrame) -> pd.DataFrame:
     df = df.copy()
@@ -143,8 +214,7 @@ def load_and_prepare_map():
 
                 if dcode:
                     for y in ["2018", "2022"]:
-                        paths = district_files(y, dcode)
-                        if all(os.path.exists(p) for p in paths.values()):
+                        if database_has_district(y, dcode):
                             files_available[y] = cache_key(y, dcode)
 
             REGION_MAP[slug] = {
@@ -223,15 +293,27 @@ def create_interactive_map(target_slugs, selected_year):
 #  CORE DATA LOGIC
 # =========================================================
 def get_candidates_df(file_id: str):
-    if file_id in DATA_CACHE: return DATA_CACHE[file_id]
-    if ":" not in str(file_id): return None
+    """Return the candidate DataFrame for one year/district from PostgreSQL.
+
+    Important: the rest of the app still receives the same DataFrame columns as before:
+    MEMBER, GROUP, RELIGION, DISTRICT, VOTES, IS_WINNER.
+    This means the UI, reports, comparison page, chat, and simulations keep working.
+    """
+    if file_id in DATA_CACHE:
+        return DATA_CACHE[file_id]
+    if ":" not in str(file_id):
+        return None
+
     year, district_code = file_id.split(":", 1)
-    if year not in YEAR_DIRS: return None
-    paths = district_files(year, district_code)
-    if not all(os.path.exists(p) for p in paths.values()): return None
 
     try:
-        seats_df = _std_cols(pd.read_excel(paths["seats"], engine="openpyxl")).rename(
+        seats_df, members_df, data_df = load_tables_from_database(year, district_code)
+        if seats_df is None or members_df is None or data_df is None:
+            return None
+        if members_df.empty or seats_df.empty:
+            return None
+
+        seats_df = _std_cols(seats_df).rename(
             columns={"REGION": "DISTRICT", "QADA": "DISTRICT", "SECT": "RELIGION", "CONFESSION": "RELIGION"}
         )
 
@@ -241,13 +323,14 @@ def get_candidates_df(file_id: str):
             for _, row in seats_df.iterrows():
                 d = str(row.get("DISTRICT", "")).strip()
                 r = str(row.get("RELIGION", "")).strip()
-                if not d or not r: continue
+                if not d or not r:
+                    continue
                 rel_limits[(d, r)] = rel_limits.get((d, r), 0) + 1
                 dist_totals[d] = dist_totals.get(d, 0) + 1
 
         QUOTA_CACHE[file_id] = {"rel_limits": rel_limits, "dist_totals": dist_totals}
 
-        members_df = _std_cols(pd.read_excel(paths["members"], engine="openpyxl"))
+        members_df = _std_cols(members_df)
         m_id = _pick(members_df, ["CANDIDATE_ID", "CANDIDATEID", "ID", "CID"])
         m_name = _pick(members_df, ["MEMBER", "CANDIDATE", "NAME", "HOLDER"])
         m_group = _pick(members_df, ["GROUP", "LIST", "LIST NAME", "LIST_NAME", "اللائحة"])
@@ -262,16 +345,20 @@ def get_candidates_df(file_id: str):
         if m_dist: ren_m[m_dist] = "DISTRICT"
         members_df = members_df.rename(columns=ren_m)
 
-        if "MEMBER" not in members_df.columns: return None
-        if "GROUP" not in members_df.columns: members_df["GROUP"] = "Independent"
-        if "RELIGION" not in members_df.columns: members_df["RELIGION"] = "Unknown"
-        if "DISTRICT" not in members_df.columns: members_df["DISTRICT"] = "General"
+        if "MEMBER" not in members_df.columns:
+            return None
+        if "GROUP" not in members_df.columns:
+            members_df["GROUP"] = "Independent"
+        if "RELIGION" not in members_df.columns:
+            members_df["RELIGION"] = "Unknown"
+        if "DISTRICT" not in members_df.columns:
+            members_df["DISTRICT"] = "General"
 
         for col in ["MEMBER", "GROUP", "RELIGION", "DISTRICT"]:
             members_df[col] = members_df[col].astype(str).str.strip()
         members_df["_NAME_KEY"] = members_df["MEMBER"].map(_norm_name)
 
-        data_df = _std_cols(pd.read_excel(paths["data"], engine="openpyxl"))
+        data_df = _std_cols(data_df)
         d_id = _pick(data_df, ["CANDIDATE_ID", "CANDIDATEID", "ID", "CID"])
         d_name = _pick(data_df, ["MEMBER", "CANDIDATE", "NAME", "HOLDER"])
         d_votes = _pick(data_df, ["VOTES", "VOTE", "TOTAL VOTES", "TOTAL_VOTES", "VOTE_LIST", "PREFERENTIAL VOTES"])
@@ -282,7 +369,8 @@ def get_candidates_df(file_id: str):
         if d_votes: ren_d[d_votes] = "VOTES"
         data_df = data_df.rename(columns=ren_d)
 
-        if "VOTES" not in data_df.columns: data_df["VOTES"] = 0
+        if "VOTES" not in data_df.columns:
+            data_df["VOTES"] = 0
         data_df["VOTES"] = pd.to_numeric(data_df["VOTES"], errors="coerce").fillna(0).astype(int)
 
         if "MEMBER" in data_df.columns:
@@ -290,17 +378,38 @@ def get_candidates_df(file_id: str):
         else:
             data_df["_NAME_KEY"] = ""
 
-        group_cols = [col for col in ["CANDIDATE_ID", "MEMBER"] if col in data_df.columns]
-        if not group_cols: return None
+        # IMPORTANT FIX for PostgreSQL import:
+        # In many Excel files CANDIDATE_ID is empty/NULL. Pandas groupby drops NULL keys,
+        # so grouping by CANDIDATE_ID made all votes disappear and the UI showed 0.
+        # Use CANDIDATE_ID only when it contains real values in BOTH tables; otherwise match by candidate name.
+        def _has_real_ids(frame, col="CANDIDATE_ID"):
+            if col not in frame.columns:
+                return False
+            ids = frame[col].astype(str).str.strip().str.lower()
+            ids = ids[~ids.isin(["", "none", "nan", "null", "nat"])]
+            return len(ids) > 0
 
-        votes_agg = data_df.groupby(group_cols, as_index=False)["VOTES"].sum()
+        use_candidate_id = _has_real_ids(members_df) and _has_real_ids(data_df)
 
-        if "CANDIDATE_ID" in members_df.columns and "CANDIDATE_ID" in votes_agg.columns:
-            merged = pd.merge(members_df, votes_agg[["CANDIDATE_ID", "VOTES"]], on="CANDIDATE_ID", how="left")
+        if use_candidate_id:
+            votes_agg = data_df.groupby("CANDIDATE_ID", as_index=False, dropna=False)["VOTES"].sum()
+            merged = pd.merge(
+                members_df,
+                votes_agg[["CANDIDATE_ID", "VOTES"]],
+                on="CANDIDATE_ID",
+                how="left"
+            )
         else:
-            if "_NAME_KEY" not in votes_agg.columns:
-                votes_agg["_NAME_KEY"] = votes_agg["MEMBER"].map(_norm_name) if "MEMBER" in votes_agg.columns else ""
-            merged = pd.merge(members_df, votes_agg[["_NAME_KEY", "VOTES"]], on="_NAME_KEY", how="left")
+            if "MEMBER" not in data_df.columns:
+                data_df["MEMBER"] = ""
+            data_df["_NAME_KEY"] = data_df["MEMBER"].map(_norm_name)
+            votes_agg = data_df.groupby("_NAME_KEY", as_index=False, dropna=False)["VOTES"].sum()
+            merged = pd.merge(
+                members_df,
+                votes_agg[["_NAME_KEY", "VOTES"]],
+                on="_NAME_KEY",
+                how="left"
+            )
 
         merged["VOTES"] = pd.to_numeric(merged.get("VOTES", 0), errors="coerce").fillna(0).astype(int)
         df_final = merged[["MEMBER", "GROUP", "RELIGION", "DISTRICT", "VOTES"]].copy()
@@ -395,6 +504,42 @@ def recompute_winners(file_id: str) -> set:
     winners = _compute_winners_from_quota(file_id, df)
     DATA_CACHE[file_id]["IS_WINNER"] = DATA_CACHE[file_id]["MEMBER"].astype(str).isin(winners)
     return winners
+
+def load_original_df(file_id: str):
+    """Load a fresh DB copy without using DATA_CACHE. Used for scenario comparison."""
+    if not file_id or ":" not in str(file_id):
+        return None
+    old_df = DATA_CACHE.pop(file_id, None)
+    try:
+        fresh = get_candidates_df(file_id)
+        return fresh.copy() if fresh is not None else None
+    finally:
+        if old_df is not None:
+            DATA_CACHE[file_id] = old_df
+
+def group_seat_map(df: pd.DataFrame) -> dict:
+    if df is None or df.empty:
+        return {}
+    return {str(k): int(v) for k, v in df[df["IS_WINNER"] == True].groupby("GROUP")["MEMBER"].count().to_dict().items()}
+
+def summarize_groups_for_compare(original_df: pd.DataFrame, current_df: pd.DataFrame):
+    groups = sorted(set(original_df["GROUP"].astype(str).unique()).union(set(current_df["GROUP"].astype(str).unique())))
+    original_seats = group_seat_map(original_df)
+    current_winners = _compute_winners_from_quota("__tmp__", current_df) if False else set(current_df[current_df["IS_WINNER"] == True]["MEMBER"].astype(str))
+    current_seats = group_seat_map(current_df)
+    rows = []
+    for g in groups:
+        ov = int(original_df[original_df["GROUP"].astype(str) == g]["VOTES"].sum())
+        cv = int(current_df[current_df["GROUP"].astype(str) == g]["VOTES"].sum())
+        os = int(original_seats.get(g, 0))
+        cs = int(current_seats.get(g, 0))
+        rows.append({
+            "group": g, "original_votes": ov, "current_votes": cv,
+            "vote_change": cv - ov, "original_seats": os, "current_seats": cs,
+            "seat_change": cs - os
+        })
+    rows.sort(key=lambda r: (r["seat_change"], r["current_votes"]), reverse=True)
+    return rows
 
 # =========================================================
 #  FAST ON-DEMAND SUGGESTION ENGINE
@@ -537,6 +682,134 @@ def calculate_votes_needed_for_one_group(file_id, df, target_group, target_k):
     SUGGESTION_CACHE[cache_id] = result
     return result
 
+
+# =========================================================
+#  ADDED FEATURE HELPERS: EXPORT + COMPARISON
+# =========================================================
+def safe_sheet_name(name: str) -> str:
+    cleaned = re.sub(r"[\\/*?:\[\]]", "_", str(name or "Sheet"))[:31]
+    return cleaned or "Sheet"
+
+def safe_download_name(name: str) -> str:
+    return re.sub(r"[^A-Za-z0-9_-]+", "_", str(name or "election_report")).strip("_")
+
+def get_region_by_file_id(file_id: str):
+    for slug, info in REGION_MAP.items():
+        if file_id in info.get("files", {}).values():
+            return slug, info
+    return None, None
+
+def build_report_tables(file_id: str):
+    df = get_candidates_df(file_id)
+    if df is None:
+        return None
+
+    working = df.copy()
+    working["VOTES"] = pd.to_numeric(working["VOTES"], errors="coerce").fillna(0).astype(int)
+
+    candidates = working.sort_values(["IS_WINNER", "VOTES"], ascending=[False, False])[
+        ["MEMBER", "GROUP", "RELIGION", "DISTRICT", "VOTES", "IS_WINNER"]
+    ]
+
+    list_summary = working.groupby("GROUP", as_index=False).agg(
+        TOTAL_VOTES=("VOTES", "sum"),
+        CANDIDATES=("MEMBER", "count"),
+        WINNERS=("IS_WINNER", "sum")
+    ).sort_values("TOTAL_VOTES", ascending=False)
+
+    district_summary = working.groupby(["DISTRICT", "RELIGION"], as_index=False).agg(
+        TOTAL_VOTES=("VOTES", "sum"),
+        CANDIDATES=("MEMBER", "count"),
+        WINNERS=("IS_WINNER", "sum")
+    ).sort_values(["DISTRICT", "RELIGION"])
+
+    winners = candidates[candidates["IS_WINNER"] == True].copy()
+
+    return {
+        "candidates": candidates,
+        "list_summary": list_summary,
+        "district_summary": district_summary,
+        "winners": winners,
+    }
+
+def make_compare_payload(slug: str):
+    if slug not in REGION_MAP:
+        return None
+
+    info = REGION_MAP[slug]
+    payload = {"region": info, "slug": slug, "years": {}, "groups": [], "winners": [], "chart_json": "{}"}
+
+    for year in ["2018", "2022"]:
+        file_id = info.get("files", {}).get(year)
+        df = get_candidates_df(file_id) if file_id else None
+        if df is None:
+            payload["years"][year] = {"available": False, "file_id": file_id}
+            continue
+
+        total_votes = int(df["VOTES"].sum())
+        total_candidates = int(len(df))
+        total_lists = int(df["GROUP"].nunique())
+        total_winners = int(df["IS_WINNER"].sum())
+        top_candidate_row = df.sort_values("VOTES", ascending=False).head(1)
+        top_candidate = None
+        if not top_candidate_row.empty:
+            r = top_candidate_row.iloc[0]
+            top_candidate = {"name": str(r["MEMBER"]), "votes": int(r["VOTES"]), "group": str(r["GROUP"])}
+
+        group_summary = df.groupby("GROUP", as_index=False).agg(
+            TOTAL_VOTES=("VOTES", "sum"), WINNERS=("IS_WINNER", "sum"), CANDIDATES=("MEMBER", "count")
+        )
+        winner_names = df[df["IS_WINNER"] == True][["MEMBER", "GROUP", "VOTES"]].sort_values("VOTES", ascending=False)
+
+        payload["years"][year] = {
+            "available": True,
+            "file_id": file_id,
+            "total_votes": total_votes,
+            "total_candidates": total_candidates,
+            "total_lists": total_lists,
+            "total_winners": total_winners,
+            "top_candidate": top_candidate,
+            "groups_df": group_summary,
+            "winners_df": winner_names,
+        }
+
+    y18 = payload["years"].get("2018", {})
+    y22 = payload["years"].get("2022", {})
+    if y18.get("available") or y22.get("available"):
+        g18 = y18.get("groups_df", pd.DataFrame(columns=["GROUP", "TOTAL_VOTES", "WINNERS", "CANDIDATES"])).rename(
+            columns={"TOTAL_VOTES": "votes_2018", "WINNERS": "winners_2018", "CANDIDATES": "candidates_2018"}
+        )
+        g22 = y22.get("groups_df", pd.DataFrame(columns=["GROUP", "TOTAL_VOTES", "WINNERS", "CANDIDATES"])).rename(
+            columns={"TOTAL_VOTES": "votes_2022", "WINNERS": "winners_2022", "CANDIDATES": "candidates_2022"}
+        )
+        merged = pd.merge(g18, g22, on="GROUP", how="outer").fillna(0)
+        for col in ["votes_2018", "winners_2018", "candidates_2018", "votes_2022", "winners_2022", "candidates_2022"]:
+            merged[col] = merged[col].astype(int)
+        merged["vote_change"] = merged["votes_2022"] - merged["votes_2018"]
+        merged["winner_change"] = merged["winners_2022"] - merged["winners_2018"]
+        merged = merged.sort_values("votes_2022", ascending=False)
+        payload["groups"] = merged.to_dict(orient="records")
+
+        fig = go.Figure()
+        fig.add_bar(name="2018", x=merged["GROUP"].tolist(), y=merged["votes_2018"].tolist())
+        fig.add_bar(name="2022", x=merged["GROUP"].tolist(), y=merged["votes_2022"].tolist())
+        fig.update_layout(
+            barmode="group", height=420, margin=dict(l=30, r=20, t=30, b=110),
+            plot_bgcolor="rgba(0,0,0,0)", paper_bgcolor="rgba(0,0,0,0)",
+            yaxis_title="Votes", xaxis_tickangle=-35, legend_title="Year"
+        )
+        payload["chart_json"] = json.dumps(fig, cls=plotly.utils.PlotlyJSONEncoder)
+
+        w18 = set(y18.get("winners_df", pd.DataFrame(columns=["MEMBER"]))["MEMBER"].astype(str).tolist()) if y18.get("available") else set()
+        w22 = set(y22.get("winners_df", pd.DataFrame(columns=["MEMBER"]))["MEMBER"].astype(str).tolist()) if y22.get("available") else set()
+        payload["winner_changes"] = {
+            "kept": sorted(list(w18 & w22)),
+            "new": sorted(list(w22 - w18)),
+            "lost": sorted(list(w18 - w22)),
+        }
+
+    return payload
+
 # =========================================================
 #  ROUTES
 # =========================================================
@@ -633,6 +906,216 @@ def region_detail(slug):
         region_slug=slug, all_candidates=all_candidates_sorted
     )
 
+
+@app.route("/compare/<slug>")
+def compare_years(slug):
+    payload = make_compare_payload(slug)
+    if payload is None:
+        return abort(404)
+    return render_template("compare.html", **payload)
+
+@app.route("/api/export_report/<file_id>/<fmt>")
+def export_report(file_id, fmt):
+    fmt = str(fmt).lower().strip()
+    tables = build_report_tables(file_id)
+    if tables is None:
+        return "Data not found.", 404
+
+    slug, info = get_region_by_file_id(file_id)
+    year = file_id.split(":", 1)[0] if ":" in file_id else "year"
+    district_label = info["district_label"] if info else file_id
+    base_name = safe_download_name(f"{district_label}_{year}_election_report")
+
+    if fmt in ["xlsx", "excel"]:
+        output = BytesIO()
+        with pd.ExcelWriter(output, engine="openpyxl") as writer:
+            tables["list_summary"].to_excel(writer, index=False, sheet_name="List Summary")
+            tables["winners"].to_excel(writer, index=False, sheet_name="Winners")
+            tables["candidates"].to_excel(writer, index=False, sheet_name="Candidates")
+            tables["district_summary"].to_excel(writer, index=False, sheet_name="District Summary")
+
+            for sheet_name in writer.sheets:
+                ws = writer.sheets[sheet_name]
+                ws.freeze_panes = "A2"
+                for col_cells in ws.columns:
+                    max_len = max(len(str(cell.value or "")) for cell in col_cells)
+                    ws.column_dimensions[col_cells[0].column_letter].width = min(max_len + 2, 45)
+
+        output.seek(0)
+        return send_file(
+            output,
+            as_attachment=True,
+            download_name=f"{base_name}.xlsx",
+            mimetype="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+        )
+
+    if fmt == "pdf":
+        try:
+            from reportlab.lib import colors
+            from reportlab.lib.enums import TA_RIGHT, TA_CENTER, TA_LEFT
+            from reportlab.lib.pagesizes import A4, landscape
+            from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
+            from reportlab.pdfbase import pdfmetrics
+            from reportlab.pdfbase.ttfonts import TTFont
+            from reportlab.platypus import SimpleDocTemplate, Paragraph, Spacer, Table, TableStyle, PageBreak
+            import arabic_reshaper
+            from bidi.algorithm import get_display
+        except Exception as e:
+            return (
+                "PDF export needs reportlab + Arabic text packages. Install them with: "
+                "pip install reportlab arabic-reshaper python-bidi. "
+                f"Original error: {e}"
+            ), 500
+
+        def first_existing_path(paths):
+            for path in paths:
+                if os.path.exists(path):
+                    return path
+            return None
+
+        # Arabic PDF fonts
+        # Put font files here: <project>/static/fonts/
+        # Supported pairs:
+        #   DejaVuSans.ttf + DejaVuSans-Bold.ttf
+        #   NotoSansArabic-Regular.ttf + NotoSansArabic-Bold.ttf
+        font_dir = os.path.join(BASE_DIR, "static", "fonts")
+        arabic_font_path = first_existing_path([
+            os.path.join(font_dir, "DejaVuSans.ttf"),
+            os.path.join(font_dir, "NotoSansArabic-Regular.ttf"),
+            # Linux fallbacks, useful during development/deployment if installed globally.
+            "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
+            "/usr/share/fonts/truetype/noto/NotoSansArabic-Regular.ttf",
+        ])
+        arabic_bold_font_path = first_existing_path([
+            os.path.join(font_dir, "DejaVuSans-Bold.ttf"),
+            os.path.join(font_dir, "NotoSansArabic-Bold.ttf"),
+            "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf",
+            "/usr/share/fonts/truetype/noto/NotoSansArabic-Bold.ttf",
+        ])
+
+        if not arabic_font_path:
+            return (
+                "Arabic PDF font missing. Create static/fonts/ and add either: "
+                "DejaVuSans.ttf + DejaVuSans-Bold.ttf OR "
+                "NotoSansArabic-Regular.ttf + NotoSansArabic-Bold.ttf. "
+                "Then restart Flask and export the PDF again."
+            ), 500
+
+        pdfmetrics.registerFont(TTFont("ArabicFont", arabic_font_path))
+        if arabic_bold_font_path:
+            pdfmetrics.registerFont(TTFont("ArabicFontBold", arabic_bold_font_path))
+        else:
+            pdfmetrics.registerFont(TTFont("ArabicFontBold", arabic_font_path))
+
+        def has_arabic(value):
+            return bool(re.search(r"[\u0600-\u06FF]", str(value or "")))
+
+        def shape_text(value):
+            text = "" if value is None else str(value)
+            # ReportLab needs Arabic glyph shaping + bidirectional display order.
+            if has_arabic(text):
+                return get_display(arabic_reshaper.reshape(text))
+            return text
+
+        output = BytesIO()
+        doc = SimpleDocTemplate(
+            output, pagesize=landscape(A4),
+            rightMargin=18, leftMargin=18, topMargin=18, bottomMargin=18
+        )
+        styles = getSampleStyleSheet()
+        styles.add(ParagraphStyle(
+            name="ArabicTitle", parent=styles["Title"], fontName="ArabicFontBold", fontSize=17,
+            leading=22, alignment=TA_CENTER
+        ))
+        styles.add(ParagraphStyle(
+            name="ArabicHeading", parent=styles["Heading2"], fontName="ArabicFontBold", fontSize=12,
+            leading=15, alignment=TA_LEFT, spaceAfter=6
+        ))
+        styles.add(ParagraphStyle(
+            name="ArabicCell", parent=styles["Normal"], fontName="ArabicFont", fontSize=7.2,
+            leading=9, alignment=TA_RIGHT, wordWrap="CJK"
+        ))
+        styles.add(ParagraphStyle(
+            name="ArabicHeaderCell", parent=styles["Normal"], fontName="ArabicFontBold", fontSize=7.5,
+            leading=9.5, alignment=TA_CENTER, textColor=colors.white
+        ))
+        styles.add(ParagraphStyle(
+            name="ArabicNormal", parent=styles["Normal"], fontName="ArabicFont", fontSize=9, leading=12
+        ))
+        styles.add(ParagraphStyle(
+            name="ArabicItalic", parent=styles["Italic"], fontName="ArabicFont", fontSize=8, leading=10
+        ))
+
+        story = []
+        story.append(Paragraph(shape_text(f"Election Report - {district_label} - {year}"), styles["ArabicTitle"]))
+        story.append(Paragraph(shape_text(f"Generated: {datetime.now().strftime('%Y-%m-%d %H:%M')}"), styles["ArabicNormal"]))
+        story.append(Spacer(1, 10))
+
+        def cleaned_for_pdf(df):
+            pdf_df = df.copy()
+            if "IS_WINNER" in pdf_df.columns:
+                pdf_df = pdf_df.drop(columns=["IS_WINNER"])
+            return pdf_df
+
+        def paragraph_cell(value, header=False):
+            style = styles["ArabicHeaderCell"] if header else styles["ArabicCell"]
+            return Paragraph(shape_text(value), style)
+
+        def col_widths_for(df):
+            cols = list(df.columns)
+            widths = []
+            for col in cols:
+                if col == "MEMBER": widths.append(105)
+                elif col == "GROUP": widths.append(145)
+                elif col in ["RELIGION", "DISTRICT"]: widths.append(75)
+                elif col in ["TOTAL_VOTES", "VOTES", "CANDIDATES", "WINNERS"]: widths.append(55)
+                else: widths.append(65)
+            total = sum(widths)
+            max_width = landscape(A4)[0] - 36
+            if total > max_width:
+                ratio = max_width / total
+                widths = [w * ratio for w in widths]
+            return widths
+
+        def add_table(title, df, max_rows=35):
+            story.append(Paragraph(shape_text(title), styles["ArabicHeading"]))
+            export_df = cleaned_for_pdf(df.head(max_rows)).copy()
+            data = [[paragraph_cell(c, header=True) for c in export_df.columns.tolist()]]
+            for row in export_df.astype(str).values.tolist():
+                data.append([paragraph_cell(v) for v in row])
+
+            table = Table(data, repeatRows=1, colWidths=col_widths_for(export_df), hAlign="LEFT")
+            table.setStyle(TableStyle([
+                ("BACKGROUND", (0, 0), (-1, 0), colors.HexColor("#0d6efd")),
+                ("TEXTCOLOR", (0, 0), (-1, 0), colors.white),
+                ("GRID", (0, 0), (-1, -1), 0.25, colors.grey),
+                ("FONTNAME", (0, 0), (-1, 0), "ArabicFontBold"),
+                ("FONTNAME", (0, 1), (-1, -1), "ArabicFont"),
+                ("VALIGN", (0, 0), (-1, -1), "TOP"),
+                ("ROWBACKGROUNDS", (0, 1), (-1, -1), [colors.white, colors.HexColor("#f5f7fb")]),
+                ("LEFTPADDING", (0, 0), (-1, -1), 3),
+                ("RIGHTPADDING", (0, 0), (-1, -1), 3),
+                ("TOPPADDING", (0, 0), (-1, -1), 3),
+                ("BOTTOMPADDING", (0, 0), (-1, -1), 3),
+            ]))
+            story.append(table)
+            if len(df) > max_rows:
+                story.append(Paragraph(shape_text(f"Showing first {max_rows} rows out of {len(df)}."), styles["ArabicItalic"]))
+            story.append(Spacer(1, 10))
+
+        # Put the winners list first because it is the most important report output.
+        add_table("Winning Candidates / المرشحون الفائزون", tables["winners"], 80)
+        add_table("List Summary / ملخص اللوائح", tables["list_summary"], 40)
+        story.append(PageBreak())
+        add_table("All Candidates / جميع المرشحين", tables["candidates"], 100)
+        add_table("District Summary / ملخص الأقضية والطوائف", tables["district_summary"], 60)
+
+        doc.build(story)
+        output.seek(0)
+        return send_file(output, as_attachment=True, download_name=f"{base_name}.pdf", mimetype="application/pdf")
+
+    return "Unsupported format. Use xlsx or pdf.", 400
+
 @app.route("/api/reset_results", methods=["POST"])
 def api_reset_results():
     file_id = (request.json or {}).get("filename")
@@ -647,6 +1130,117 @@ def api_get_votes_needed():
     file_id, target_group, target_k = data.get("filename"), data.get("group_name"), str(data.get("target_k", "1"))
     if not file_id or file_id not in DATA_CACHE: return jsonify({"success": False}), 400
     return jsonify({"success": True, "result": calculate_votes_needed_for_one_group(file_id, DATA_CACHE[file_id], target_group, target_k)})
+
+@app.route("/api/scenario_comparison", methods=["POST"])
+def api_scenario_comparison():
+    data = request.json or {}
+    file_id = data.get("filename")
+    current_df = DATA_CACHE.get(file_id)
+    original_df = load_original_df(file_id)
+    if current_df is None or original_df is None:
+        return jsonify({"success": False, "message": "Data not available."}), 400
+
+    # Make sure current winners reflect the latest state.
+    current_winners = _compute_winners_from_quota(file_id, current_df)
+    current_df = current_df.copy()
+    current_df["IS_WINNER"] = current_df["MEMBER"].astype(str).isin(current_winners)
+
+    original_winners = set(original_df[original_df["IS_WINNER"] == True]["MEMBER"].astype(str))
+    current_winners = set(current_df[current_df["IS_WINNER"] == True]["MEMBER"].astype(str))
+
+    moved_candidates = []
+    original_groups = dict(zip(original_df["MEMBER"].astype(str), original_df["GROUP"].astype(str)))
+    for _, row in current_df.iterrows():
+        name = str(row["MEMBER"])
+        old_group = original_groups.get(name)
+        new_group = str(row["GROUP"])
+        if old_group is not None and old_group != new_group:
+            moved_candidates.append({"name": name, "from": old_group, "to": new_group, "votes": int(row["VOTES"])})
+
+    rows = summarize_groups_for_compare(original_df, current_df)
+    return jsonify({
+        "success": True,
+        "metrics": {
+            "original_votes": int(original_df["VOTES"].sum()),
+            "current_votes": int(current_df["VOTES"].sum()),
+            "original_winners": len(original_winners),
+            "current_winners": len(current_winners),
+            "moved_candidates": len(moved_candidates),
+            "new_winners": len(current_winners - original_winners),
+            "lost_winners": len(original_winners - current_winners),
+        },
+        "groups": rows,
+        "new_winners": sorted(list(current_winners - original_winners)),
+        "lost_winners": sorted(list(original_winners - current_winners)),
+        "unchanged_winners": sorted(list(current_winners & original_winners)),
+        "moves": moved_candidates[:80]
+    })
+
+@app.route("/api/what_if_advisor", methods=["POST"])
+def api_what_if_advisor():
+    data = request.json or {}
+    file_id = data.get("filename")
+    target_group = data.get("group_name")
+    df = DATA_CACHE.get(file_id)
+    if df is None or not target_group:
+        return jsonify({"success": False, "message": "Choose a list first."}), 400
+
+    current_winners = _compute_winners_from_quota(file_id, df)
+    current_seats = count_group_winners(df, current_winners)
+    baseline = int(current_seats.get(target_group, 0))
+
+    votes_needed = calculate_votes_needed_for_one_group(file_id, df, target_group, "1") or {}
+
+    # Simulate list vote swings: increase all candidates inside the selected list.
+    swings = []
+    for pct in [3, 5, 10, 15, 20]:
+        sim_df = df.copy()
+        mask = sim_df["GROUP"] == target_group
+        sim_df.loc[mask, "VOTES"] = (sim_df.loc[mask, "VOTES"].astype(float) * (1 + pct / 100.0)).round().astype(int)
+        sim_winners = _compute_winners_from_quota(file_id, sim_df)
+        sim_seats = count_group_winners(sim_df, sim_winners)
+        after = int(sim_seats.get(target_group, 0))
+        swings.append({"percent": pct, "seats_after": after, "seat_gain": after - baseline})
+
+    target_df = df[df["GROUP"] == target_group].copy().sort_values("VOTES", ascending=False)
+    winners_df = target_df[target_df["MEMBER"].astype(str).isin(current_winners)]
+    non_winners_df = target_df[~target_df["MEMBER"].astype(str).isin(current_winners)]
+
+    best_candidate = None
+    if not non_winners_df.empty:
+        r = non_winners_df.iloc[0]
+        best_candidate = {"name": str(r["MEMBER"]), "votes": int(r["VOTES"]), "religion": str(r["RELIGION"]), "district": str(r["DISTRICT"])}
+
+    weakest_winner = None
+    other_winners = df[(df["MEMBER"].astype(str).isin(current_winners)) & (df["GROUP"] != target_group)].copy().sort_values("VOTES", ascending=True)
+    if not other_winners.empty:
+        r = other_winners.iloc[0]
+        weakest_winner = {"name": str(r["MEMBER"]), "group": str(r["GROUP"]), "votes": int(r["VOTES"]), "religion": str(r["RELIGION"]), "district": str(r["DISTRICT"])}
+
+    suggestions = votes_needed.get("suggestions", []) if isinstance(votes_needed, dict) else []
+    summary = []
+    if baseline == 0:
+        summary.append("The selected list currently has no seats. The first goal is passing the electoral threshold.")
+    else:
+        summary.append(f"The selected list currently has {baseline} seat(s).")
+    if isinstance(votes_needed, dict) and votes_needed.get("votes"):
+        summary.append(f"Approximate additional votes needed for one more seat: {int(votes_needed.get('votes')):,}.")
+    if suggestions:
+        summary.append("The engine found swap scenarios that may produce an extra seat.")
+    else:
+        summary.append("No safe direct swap was found, so try vote swing or coalition changes.")
+
+    return jsonify({
+        "success": True,
+        "group": target_group,
+        "baseline_seats": baseline,
+        "current_votes": int(df[df["GROUP"] == target_group]["VOTES"].sum()),
+        "votes_needed": votes_needed,
+        "swings": swings,
+        "best_non_winner": best_candidate,
+        "weakest_external_winner": weakest_winner,
+        "summary": summary
+    })
 
 @app.route("/api/analyze_virtual_list", methods=["POST"])
 def analyze_virtual_list():
@@ -987,7 +1581,6 @@ def api_chat():
         html += "</div>"
         return jsonify({"reply": html, "action": "none"})
 
-    # --- 6) CANDIDATE LOOKUP: "أصوات X" or "كم صوت X" ---
     if any(w in msg for w in ["أصوات", "صوت", "كم", "votes"]):
         best_match = None
         best_score = 0

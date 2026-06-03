@@ -80,6 +80,15 @@
         .candidate-card.winner-card.selected { border: 2px solid #0d6efd !important; background-color: #d4edda !important; }
         .sel-checkbox { cursor: pointer; width: 17px; height: 17px; accent-color: #0d6efd; flex-shrink: 0; margin-top: 3px; }
 
+        /* Candidate profile modal */
+        .candidate-card:hover { transform: translateY(-1px); box-shadow: 0 3px 10px rgba(0,0,0,0.08); }
+        .profile-value { font-weight: 700; color: #1f2937; }
+        .profile-label { color: #6b7280; font-size: 0.78rem; font-weight: 700; text-transform: uppercase; letter-spacing: .03em; }
+        .profile-row { border-bottom: 1px solid #eef0f3; padding: 9px 0; }
+        .profile-row:last-child { border-bottom: none; }
+        .profile-status-winner { color: #1b5e20; background: #e8f5e9; border: 1px solid #a5d6a7; padding: 4px 10px; border-radius: 999px; font-weight: 800; }
+        .profile-status-loser { color: #555; background: #f1f3f5; border: 1px solid #d7dce1; padding: 4px 10px; border-radius: 999px; font-weight: 800; }
+
         /* ===== ADVANCED CHAT STYLES ===== */
         .chat-body { flex-grow: 1; padding: 14px; overflow-y: auto; background: linear-gradient(180deg, #f8f9fc 0%, #eef1f6 100%); display: flex; flex-direction: column; gap: 8px; direction: rtl; font-size: 0.84rem; scroll-behavior: smooth; }
         .chat-body::-webkit-scrollbar { width: 4px; }
@@ -135,6 +144,15 @@
         .welcome-card .cmd-list li { font-size: 0.78rem; padding: 3px 0; color: #4a5568; cursor: pointer; transition: color 0.2s; }
         .welcome-card .cmd-list li:hover { color: #667eea; }
         .welcome-card .cmd-list li code { background: rgba(102,126,234,0.1); color: #667eea; padding: 1px 6px; border-radius: 4px; font-size: 0.75rem; font-family: 'Tajawal', monospace; }
+        .search-toolbar { background: white; border-radius: 14px; padding: 14px; box-shadow: 0 2px 12px rgba(0,0,0,0.06); margin-bottom: 16px; }
+        .search-toolbar input { border-radius: 10px; }
+        .list-hidden-by-search { display: none !important; }
+        .candidate-hidden-by-search { display: none !important; }
+        .export-btn { font-weight: 700; }
+        .advisor-card { border: 0; border-radius: 14px; overflow: hidden; box-shadow: 0 3px 14px rgba(0,0,0,0.08); }
+        .advisor-metric { background:#f8f9fc; border-radius:12px; padding:10px; text-align:center; }
+        .advisor-metric .num { font-size:1.35rem; font-weight:800; color:#0d6efd; }
+        .scenario-table th, .scenario-table td { font-size:0.85rem; vertical-align:middle; }
     </style>
 </head>
 <body>
@@ -156,7 +174,9 @@
         <div class="d-flex align-items-center gap-2">
             <a href="/region/{{ region_slug }}?year=2018" class="btn btn-{{ 'primary' if current_year == '2018' else 'outline-primary' }} btn-sm fw-bold px-3">2018</a>
             <a href="/region/{{ region_slug }}?year=2022" class="btn btn-{{ 'primary' if current_year == '2022' else 'outline-primary' }} btn-sm fw-bold px-3">2022</a>
-            <a href="/?year={{ current_year }}" class="btn btn-outline-dark btn-sm">← Back</a>
+            <a href="/compare/{{ region_slug }}" class="btn btn-outline-success btn-sm fw-bold px-3" data-i18n="compare_years">Compare 2018/2022</a>
+            <button class="btn btn-outline-warning btn-sm fw-bold px-3" onclick="openScenarioComparison()" data-i18n="scenario_compare">Scenario Comparison</button>
+            <a href="/?year={{ current_year }}" class="btn btn-outline-dark btn-sm" data-i18n="back">← Back</a>
         </div>
     </div>
 
@@ -182,9 +202,11 @@
 
     <hr class="my-4">
 
-    <div class="d-flex justify-content-center mb-4 gap-3">
-        <button class="btn btn-success px-5 fw-bold" id="btnRecalc" onclick="recalcResults()">Recalculate Results</button>
-        <button class="btn btn-outline-danger px-4 fw-bold" id="btnReset" onclick="resetDefaultResults()">Reset to Default / استعادة الأصلي</button>
+    <div class="d-flex justify-content-center mb-4 gap-3 flex-wrap">
+        <button class="btn btn-success px-5 fw-bold" id="btnRecalc" onclick="recalcResults()" data-i18n="recalculate">Recalculate Results</button>
+        <a class="btn btn-outline-primary px-4 export-btn" href="/api/export_report/{{ file_id }}/xlsx" data-i18n="export_excel">Export Excel</a>
+        <a class="btn btn-outline-secondary px-4 export-btn" href="/api/export_report/{{ file_id }}/pdf" data-i18n="export_pdf">Export PDF</a>
+        <button class="btn btn-outline-danger px-4 fw-bold" id="btnReset" onclick="resetDefaultResults()" data-i18n="reset">Reset to Default</button>
     </div>
 
     <div class="row">
@@ -236,7 +258,18 @@
 
 
             
-            <h5 class="fw-bold mb-3 text-center text-md-start">Live List Standings</h5>
+            <div class="search-toolbar">
+                <div class="row g-2 align-items-center">
+                    <div class="col-md-8">
+                        <input id="candidateSearch" class="form-control" type="search" placeholder="Search candidate, list, religion, or district..." data-i18n-placeholder="candidate_search" oninput="filterCandidatesAndLists()">
+                    </div>
+                    <div class="col-md-4 text-md-end text-muted small">
+                        <span id="candidateSearchCount" data-i18n="showing_all">Showing all candidates</span>
+                    </div>
+                </div>
+            </div>
+
+            <h5 class="fw-bold mb-3 text-center text-md-start" data-i18n="live_standings">Live List Standings</h5>
             <div class="row row-cols-1 row-cols-md-2 row-cols-xl-3 g-3 pb-3" id="lists-container">
                 {% for group_name, candidates in groups.items() %}
                 {% set total_votes = candidates|sum(attribute='votes') %}
@@ -250,11 +283,12 @@
                         </div>
                         <div class="sortable-list" id="list-{{ safe_id }}" data-group="{{ group_name }}">
                             {% for c in candidates %}
-                            <div class="candidate-card {{ 'winner-card' if c.is_winner else 'loser-card' }}" data-name="{{ c.name }}" data-votes="{{ c.votes }}" data-religion="{{ c.religion }}">
+                            <div class="candidate-card {{ 'winner-card' if c.is_winner else 'loser-card' }}" onclick="openCandidateProfile(this)" data-name="{{ c.name }}" data-votes="{{ c.votes }}" data-religion="{{ c.religion }}" data-district="{{ c.district }}" data-group="{{ group_name }}" data-winner="{{ 'true' if c.is_winner else 'false' }}">
                                 <div class="d-flex justify-content-between align-items-center">
                                     <div class="text-truncate d-flex align-items-start gap-2">
                                         <input type="checkbox" class="sel-checkbox mt-1"
                                             title="Select for new list"
+                                            onclick="event.stopPropagation()"
                                             onchange="toggleCandidateSelection(this, '{{ c.name }}')">
                                         <div>
                                             <div class="fw-bold">{{ c.name }}</div>
@@ -299,6 +333,29 @@
                 </div>
             </div>
 
+            <div class="card advisor-card mb-5">
+                <div class="card-header bg-primary text-white text-end" style="direction: rtl;">
+                    <h6 class="mb-0 fw-bold" data-i18n="what_if_title">💡 What If Smart Advisor</h6>
+                </div>
+                <div class="card-body" style="direction: rtl; text-align: right;">
+                    <p class="text-muted small mb-3" data-i18n="what_if_desc">اختر لائحة ليحلل النظام ماذا تحتاج لتربح مقعداً إضافياً، وما تأثير زيادة الأصوات بنسبة معينة.</p>
+                    <div class="row align-items-start">
+                        <div class="col-md-4 mb-3 mb-md-0">
+                            <select id="smartAdvisorList" class="form-select fw-bold border-primary text-primary shadow-sm mb-2">
+                                <option value="" disabled selected data-i18n="choose_list">-- اختر اللائحة --</option>
+                                {% for group_name in groups.keys() %}
+                                <option value="{{ group_name }}">{{ group_name }}</option>
+                                {% endfor %}
+                            </select>
+                            <button class="btn btn-primary w-100 fw-bold" onclick="runSmartAdvisor()" data-i18n="run_advisor">Run Advisor</button>
+                        </div>
+                        <div class="col-md-8">
+                            <div id="smartAdvisorResult" class="p-3 border rounded bg-light" style="display:none;"></div>
+                        </div>
+                    </div>
+                </div>
+            </div>
+
             <div class="card shadow-sm border-0 mb-5">
                 <div class="card-header bg-success text-white text-end" style="direction: rtl;">
                     <h6 class="mb-0 fw-bold">🎯 مستشار الفوز — في أي لائحة يفوز هذا المرشح؟</h6>
@@ -325,10 +382,163 @@
     </div>
 </div>
 
+<!-- Candidate Profile Modal -->
+<div class="modal fade" id="candidateProfileModal" tabindex="-1" aria-hidden="true">
+    <div class="modal-dialog modal-dialog-centered">
+        <div class="modal-content border-0 shadow-lg">
+            <div class="modal-header bg-primary text-white">
+                <div>
+                    <h5 class="modal-title fw-bold mb-0" id="profileName">Candidate Profile</h5>
+                    <small id="profileSub" class="opacity-75"></small>
+                </div>
+                <button type="button" class="btn-close btn-close-white" data-bs-dismiss="modal" aria-label="Close"></button>
+            </div>
+            <div class="modal-body">
+                <div class="profile-row">
+                    <div class="profile-label">List</div>
+                    <div class="profile-value" id="profileGroup">-</div>
+                </div>
+                <div class="profile-row">
+                    <div class="row">
+                        <div class="col-6">
+                            <div class="profile-label">District</div>
+                            <div class="profile-value" id="profileDistrict">-</div>
+                        </div>
+                        <div class="col-6">
+                            <div class="profile-label">Religion / Sect</div>
+                            <div class="profile-value" id="profileReligion">-</div>
+                        </div>
+                    </div>
+                </div>
+                <div class="profile-row">
+                    <div class="row">
+                        <div class="col-6">
+                            <div class="profile-label">Votes</div>
+                            <div class="profile-value" id="profileVotes">-</div>
+                        </div>
+                        <div class="col-6">
+                            <div class="profile-label">Status</div>
+                            <div id="profileStatus">-</div>
+                        </div>
+                    </div>
+                </div>
+                <div class="profile-row">
+                    <div class="row">
+                        <div class="col-6">
+                            <div class="profile-label">% inside list</div>
+                            <div class="profile-value" id="profileListPercent">-</div>
+                        </div>
+                        <div class="col-6">
+                            <div class="profile-label">% inside district</div>
+                            <div class="profile-value" id="profileDistrictPercent">-</div>
+                        </div>
+                    </div>
+                </div>
+            </div>
+            <div class="modal-footer">
+                <button type="button" class="btn btn-outline-secondary" data-bs-dismiss="modal">Close</button>
+            </div>
+        </div>
+    </div>
+</div>
 
+<!-- Scenario Comparison Modal -->
+<div class="modal fade" id="scenarioComparisonModal" tabindex="-1" aria-hidden="true">
+    <div class="modal-dialog modal-xl modal-dialog-scrollable">
+        <div class="modal-content border-0 shadow-lg">
+            <div class="modal-header bg-warning">
+                <div>
+                    <h5 class="modal-title fw-bold mb-0" data-i18n="scenario_compare">Scenario Comparison</h5>
+                    <small class="text-dark" data-i18n="scenario_subtitle">Original database result vs current simulated result</small>
+                </div>
+                <button type="button" class="btn-close" data-bs-dismiss="modal" aria-label="Close"></button>
+            </div>
+            <div class="modal-body">
+                <div id="scenarioComparisonBody"><div class="text-muted">Loading...</div></div>
+            </div>
+        </div>
+    </div>
+</div>
+
+<script src="https://cdn.jsdelivr.net/npm/bootstrap@5.1.3/dist/js/bootstrap.bundle.min.js"></script>
 
 <script>
     const filename = "{{ file_id }}";
+
+    function safeNumber(value) {
+        const n = parseFloat(value || '0');
+        return Number.isFinite(n) ? n : 0;
+    }
+
+    function formatPercent(part, total) {
+        if (!total || total <= 0) return '0%';
+        return ((part / total) * 100).toFixed(2) + '%';
+    }
+
+    function openCandidateProfile(card) {
+        if (!card) return;
+
+        const name = card.dataset.name || '-';
+        const group = card.dataset.group || '-';
+        const religion = card.dataset.religion || '-';
+        const district = card.dataset.district || '-';
+        const votes = safeNumber(card.dataset.votes);
+        const isWinner = card.dataset.winner === 'true' || card.classList.contains('winner-card');
+
+        let listTotal = 0;
+        let districtTotal = 0;
+        document.querySelectorAll('.candidate-card').forEach(c => {
+            const v = safeNumber(c.dataset.votes);
+            if ((c.dataset.group || '') === group) listTotal += v;
+            if ((c.dataset.district || '') === district) districtTotal += v;
+        });
+
+        document.getElementById('profileName').textContent = name;
+        document.getElementById('profileSub').textContent = group;
+        document.getElementById('profileGroup').textContent = group;
+        document.getElementById('profileDistrict').textContent = district;
+        document.getElementById('profileReligion').textContent = religion;
+        document.getElementById('profileVotes').textContent = votes.toLocaleString();
+        document.getElementById('profileListPercent').textContent = formatPercent(votes, listTotal);
+        document.getElementById('profileDistrictPercent').textContent = formatPercent(votes, districtTotal);
+
+        const status = document.getElementById('profileStatus');
+        status.innerHTML = isWinner
+            ? '<span class="profile-status-winner">WINNER</span>'
+            : '<span class="profile-status-loser">LOSER</span>';
+
+        const modal = new bootstrap.Modal(document.getElementById('candidateProfileModal'));
+        modal.show();
+    }
+
+    function filterCandidatesAndLists() {
+        const q = document.getElementById('candidateSearch').value.trim().toLowerCase();
+        const cards = document.querySelectorAll('.candidate-card');
+        let visibleCandidates = 0;
+
+        cards.forEach(card => {
+            const haystack = [
+                card.dataset.name || '',
+                card.dataset.group || '',
+                card.dataset.religion || '',
+                card.dataset.district || '',
+                card.dataset.votes || ''
+            ].join(' ').toLowerCase();
+            const show = haystack.includes(q);
+            card.classList.toggle('candidate-hidden-by-search', !show);
+            if (show) visibleCandidates++;
+        });
+
+        document.querySelectorAll('#lists-container > .col').forEach(col => {
+            const visibleInside = col.querySelectorAll('.candidate-card:not(.candidate-hidden-by-search)').length;
+            const listName = (col.querySelector('.list-header')?.textContent || '').toLowerCase();
+            const showList = visibleInside > 0 || (q && listName.includes(q));
+            col.classList.toggle('list-hidden-by-search', !showList);
+        });
+
+        const counter = document.getElementById('candidateSearchCount');
+        counter.textContent = q ? `${visibleCandidates} matching candidate${visibleCandidates === 1 ? '' : 's'}` : 'Showing all candidates';
+    }
 
     // =============================================
     // NEW LIST BUILDER — SELECTION LOGIC
@@ -936,6 +1146,85 @@
             document.getElementById('acDropdown').classList.remove('active');
         }
     });
+
+    async function openScenarioComparison() {
+        const body = document.getElementById('scenarioComparisonBody');
+        body.innerHTML = `<div class="text-muted">Loading comparison...</div>`;
+        new bootstrap.Modal(document.getElementById('scenarioComparisonModal')).show();
+        try {
+            const res = await fetch('/api/scenario_comparison', {
+                method: 'POST', headers: {'Content-Type': 'application/json'},
+                body: JSON.stringify({ filename })
+            });
+            const data = await res.json();
+            if (!data.success) { body.innerHTML = `<div class="alert alert-danger">${data.message || 'Cannot compare scenario.'}</div>`; return; }
+            const m = data.metrics;
+            let html = `
+                <div class="row g-3 mb-3">
+                    <div class="col-md-2"><div class="advisor-metric"><div class="num">${m.moved_candidates}</div><div class="small text-muted">Moved candidates</div></div></div>
+                    <div class="col-md-2"><div class="advisor-metric"><div class="num text-success">${m.new_winners}</div><div class="small text-muted">New winners</div></div></div>
+                    <div class="col-md-2"><div class="advisor-metric"><div class="num text-danger">${m.lost_winners}</div><div class="small text-muted">Lost winners</div></div></div>
+                    <div class="col-md-3"><div class="advisor-metric"><div class="num">${m.current_winners}</div><div class="small text-muted">Current winners</div></div></div>
+                    <div class="col-md-3"><div class="advisor-metric"><div class="num">${m.current_votes.toLocaleString()}</div><div class="small text-muted">Total votes</div></div></div>
+                </div>`;
+            html += `<h6 class="fw-bold">List impact</h6><div class="table-responsive"><table class="table table-sm table-hover scenario-table"><thead class="table-light"><tr><th>List</th><th class="text-end">Original votes</th><th class="text-end">Current votes</th><th class="text-end">Vote change</th><th class="text-end">Original seats</th><th class="text-end">Current seats</th><th class="text-end">Seat change</th></tr></thead><tbody>`;
+            data.groups.forEach(r => {
+                const cls = r.seat_change > 0 ? 'text-success fw-bold' : (r.seat_change < 0 ? 'text-danger fw-bold' : 'text-muted');
+                html += `<tr><td class="fw-bold">${r.group}</td><td class="text-end">${r.original_votes.toLocaleString()}</td><td class="text-end">${r.current_votes.toLocaleString()}</td><td class="text-end">${r.vote_change.toLocaleString()}</td><td class="text-end">${r.original_seats}</td><td class="text-end">${r.current_seats}</td><td class="text-end ${cls}">${r.seat_change > 0 ? '+' : ''}${r.seat_change}</td></tr>`;
+            });
+            html += `</tbody></table></div>`;
+            html += `<div class="row g-3 mt-2"><div class="col-md-6"><h6 class="text-success fw-bold">New winners</h6>${data.new_winners.length ? data.new_winners.map(x=>`<span class="badge bg-success me-1 mb-1">${x}</span>`).join('') : '<span class="text-muted">No new winners.</span>'}</div><div class="col-md-6"><h6 class="text-danger fw-bold">Lost winners</h6>${data.lost_winners.length ? data.lost_winners.map(x=>`<span class="badge bg-danger me-1 mb-1">${x}</span>`).join('') : '<span class="text-muted">No lost winners.</span>'}</div></div>`;
+            if (data.moves.length) {
+                html += `<hr><h6 class="fw-bold">Candidate moves</h6><div class="table-responsive"><table class="table table-sm scenario-table"><thead><tr><th>Candidate</th><th>From</th><th>To</th><th class="text-end">Votes</th></tr></thead><tbody>`;
+                data.moves.forEach(x => html += `<tr><td>${x.name}</td><td>${x.from}</td><td>${x.to}</td><td class="text-end">${x.votes.toLocaleString()}</td></tr>`);
+                html += `</tbody></table></div>`;
+            }
+            body.innerHTML = html;
+        } catch (e) {
+            body.innerHTML = `<div class="alert alert-danger">Connection failed.</div>`;
+        }
+    }
+
+    async function runSmartAdvisor() {
+        const group = document.getElementById('smartAdvisorList').value;
+        const box = document.getElementById('smartAdvisorResult');
+        if (!group) return;
+        box.style.display = 'block';
+        box.innerHTML = `<div class="text-muted">Analyzing scenario...</div>`;
+        try {
+            const res = await fetch('/api/what_if_advisor', {
+                method: 'POST', headers: {'Content-Type': 'application/json'},
+                body: JSON.stringify({ filename, group_name: group })
+            });
+            const data = await res.json();
+            if (!data.success) { box.innerHTML = `<div class="text-danger">${data.message || 'Advisor failed.'}</div>`; return; }
+            let html = `<div class="row g-2 mb-3">
+                <div class="col-md-4"><div class="advisor-metric"><div class="num">${data.baseline_seats}</div><div class="small text-muted">Current seats</div></div></div>
+                <div class="col-md-4"><div class="advisor-metric"><div class="num">${data.current_votes.toLocaleString()}</div><div class="small text-muted">List votes</div></div></div>
+                <div class="col-md-4"><div class="advisor-metric"><div class="num">${data.votes_needed && data.votes_needed.votes ? data.votes_needed.votes.toLocaleString() : '-'}</div><div class="small text-muted">Votes needed</div></div></div>
+            </div>`;
+            html += `<ul class="mb-3">${data.summary.map(x=>`<li>${x}</li>`).join('')}</ul>`;
+            html += `<h6 class="fw-bold">Vote swing simulation</h6><div class="d-flex flex-wrap gap-2 mb-3">`;
+            data.swings.forEach(s => {
+                const badge = s.seat_gain > 0 ? 'bg-success' : 'bg-secondary';
+                html += `<span class="badge ${badge} p-2">+${s.percent}% votes → ${s.seats_after} seats (${s.seat_gain >= 0 ? '+' : ''}${s.seat_gain})</span>`;
+            });
+            html += `</div>`;
+            if (data.best_non_winner) html += `<div class="alert alert-info py-2"><b>Best candidate to push:</b> ${data.best_non_winner.name} — ${data.best_non_winner.votes.toLocaleString()} votes (${data.best_non_winner.religion} / ${data.best_non_winner.district})</div>`;
+            if (data.weakest_external_winner) html += `<div class="alert alert-warning py-2"><b>Weak external winner:</b> ${data.weakest_external_winner.name} from ${data.weakest_external_winner.group} — ${data.weakest_external_winner.votes.toLocaleString()} votes</div>`;
+            if (data.votes_needed && data.votes_needed.suggestions && data.votes_needed.suggestions.length) {
+                html += `<h6 class="fw-bold text-success">Suggested swaps</h6>`;
+                data.votes_needed.suggestions.slice(0,3).forEach((sg, i) => {
+                    html += `<div class="border rounded p-2 mb-2"><b>Option ${i+1}</b> <span class="badge bg-success">+${sg.total_gain.toLocaleString()} votes</span><ul class="mb-0 mt-1">`;
+                    sg.swaps.forEach(sw => html += `<li>Out: <b>${sw.out}</b> / In: <b>${sw.in}</b> (${sw.religion} - ${sw.district})</li>`);
+                    html += `</ul></div>`;
+                });
+            }
+            box.innerHTML = html;
+        } catch (e) {
+            box.innerHTML = `<div class="text-danger">Connection failed.</div>`;
+        }
+    }
 
     // --- RECALCULATE LOGIC ---
     async function recalcResults() {

@@ -68,6 +68,19 @@
             padding: 8px 0;
         }
 
+        .sidebar-search {
+            margin-top: 1rem;
+            border-radius: 10px;
+            font-size: 0.9rem;
+        }
+
+        .district-empty {
+            display: none;
+            padding: 18px 24px;
+            color: #6c757d;
+            font-size: 0.9rem;
+        }
+
         /* --- MAP AREA STYLING --- */
         .map-container {
             position: relative;
@@ -100,19 +113,21 @@
         
         <div class="col-md-3 col-lg-2 sidebar">
             <div class="sidebar-header">
-                <div class="sidebar-title">Elections <span class="text-primary">{{ current_year }}</span></div>
+                <div class="sidebar-title" data-i18n="elections">Elections <span class="text-primary">{{ current_year }}</span></div>
                 <div class="d-flex justify-content-between">
                     <a href="/?year=2018" class="btn btn-sm btn-year {{ 'btn-primary' if current_year == '2018' else 'btn-outline-secondary' }}">2018</a>
                     <a href="/?year=2022" class="btn btn-sm btn-year {{ 'btn-primary' if current_year == '2022' else 'btn-outline-secondary' }}">2022</a>
                 </div>
+                <input id="districtSearch" class="form-control sidebar-search" type="search" placeholder="Search district..." data-i18n-placeholder="search_district" oninput="filterDistricts()">
             </div>
 
-            <div class="district-list">
+            <div class="district-list" id="districtList">
                 {% for region in regions %}
-                <a href="/region/{{ region.slug }}?year={{ current_year }}" class="district-item">
+                <a href="/region/{{ region.slug }}?year={{ current_year }}" class="district-item" data-search="{{ region.district_label }} {{ region.name }}">
                     {{ region.district_label }}
                 </a>
                 {% endfor %}
+                <div id="districtEmpty" class="district-empty"><span data-i18n="no_district">No matching district found.</span></div>
             </div>
         </div>
 
@@ -175,6 +190,19 @@
         document.getElementById(divId).on('plotly_unhover', function(data){
             document.getElementById(divId).style.cursor = 'default';
         });
+    }
+
+    function filterDistricts() {
+        const q = document.getElementById('districtSearch').value.trim().toLowerCase();
+        const items = document.querySelectorAll('.district-item');
+        let visible = 0;
+        items.forEach(item => {
+            const text = (item.dataset.search || item.textContent).toLowerCase();
+            const show = text.includes(q);
+            item.style.display = show ? 'block' : 'none';
+            if (show) visible++;
+        });
+        document.getElementById('districtEmpty').style.display = visible ? 'none' : 'block';
     }
 
     // Initialize the single map

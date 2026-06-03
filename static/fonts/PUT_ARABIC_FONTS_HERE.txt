@@ -1,0 +1,13 @@
+Put one of these font pairs in this folder:
+
+Option A (recommended mixed Arabic + English):
+- DejaVuSans.ttf
+- DejaVuSans-Bold.ttf
+
+Option B:
+- NotoSansArabic-Regular.ttf
+- NotoSansArabic-Bold.ttf
+
+Do not rename the files differently unless you also update app.py.
+The PDF exporter checks this folder first:
+static/fonts/
