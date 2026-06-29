@@ -549,7 +549,7 @@ def count_group_winners(df: pd.DataFrame, winners: set) -> dict:
     if winner_df.empty: return {}
     return {str(k): int(v) for k, v in winner_df.groupby("GROUP")["MEMBER"].count().to_dict().items()}
 
-def get_current_group_seats(file_id: str, df: pd.DataFrame) -> dict:
+def get_current_group_seats(file_id: str, df: pd.DataFrame) -> dict:     # return a dictionary: {group_name: number_of_seats_won}
     return count_group_winners(df, _compute_winners_from_quota(file_id, df))
 
 def build_atomic_swaps_for_group(df: pd.DataFrame, target_group: str):
@@ -560,20 +560,20 @@ def build_atomic_swaps_for_group(df: pd.DataFrame, target_group: str):
     for _, c_src in list_cands.iterrows():
         for _, c_tgt in other_cands.iterrows():
             if str(c_src["RELIGION"]) == str(c_tgt["RELIGION"]) and str(c_src["DISTRICT"]) == str(c_tgt["DISTRICT"]):
-                net_gain = int(c_tgt["VOTES"]) - int(c_src["VOTES"])
-                if net_gain > 0:
+                net_gain = int(c_tgt["VOTES"]) - int(c_src["VOTES"])        #check if the swap would result in a net gain of votes for the target group
+                if net_gain > 0:                
                     atomic.append({
                         "out": str(c_src["MEMBER"]), "in": str(c_tgt["MEMBER"]),
                         "from_list": str(c_tgt["GROUP"]), "net_gain": int(net_gain),
-                        "religion": str(c_src["RELIGION"]), "district": str(c_src["DISTRICT"]),
+                        "religion": str(c_src["RELIGION"]), "district": str(c_src["DISTRICT"]),     #only allow swaps within the same religion and district
                     })
 
-    atomic = sorted(atomic, key=lambda x: x["net_gain"], reverse=True)
-    seen, uniq = set(), []
-    for a in atomic:
+    atomic = sorted(atomic, key=lambda x: x["net_gain"], reverse=True)      #sort by net gain descending
+    seen, uniq = set(), []              
+    for a in atomic:                
         if (a["out"], a["in"]) not in seen:
-            seen.add((a["out"], a["in"]))
-            uniq.append(a)
+            seen.add((a["out"], a["in"]))   
+            uniq.append(a)                  #only keep unique swaps (no duplicates)
     return uniq[:12]
 
 def is_valid_combo(combo):
@@ -581,7 +581,7 @@ def is_valid_combo(combo):
     for s in combo:
         if s["out"] in used_out or s["in"] in used_in: return False
         used_out.add(s["out"]); used_in.add(s["in"])
-    return True
+    return True             #check that no candidate is swapped more than once in the same combo
 
 def apply_swap_combo_to_copy(df: pd.DataFrame, combo):
     sim_df = df.copy()
@@ -594,32 +594,32 @@ def apply_swap_combo_to_copy(df: pd.DataFrame, combo):
             return None
         sim_df.loc[sim_df["MEMBER"] == s["out"], "GROUP"] = tgt_group
         sim_df.loc[sim_df["MEMBER"] == s["in"], "GROUP"] = src_group
-    return sim_df
+    return sim_df           #simulate the effect of a swap combo on the DataFrame and return the modified copy
 
 def simulate_combo_gain(file_id: str, df: pd.DataFrame, target_group: str, combo, baseline_seats: int):
     sim_df = apply_swap_combo_to_copy(df, combo)
     if sim_df is None: return None
     seats_after_map = count_group_winners(sim_df, _compute_winners_from_quota(file_id, sim_df))
     seats_after = int(seats_after_map.get(target_group, 0))
-    return {"seat_gain": int(seats_after - baseline_seats), "seats_after": seats_after}
+    return {"seat_gain": int(seats_after - baseline_seats), "seats_after": seats_after}     #simulate the effect of a swap combo on the number of seats won by the target group and return the result
 
 def calculate_votes_needed_for_one_group(file_id, df, target_group, target_k):
     quota = QUOTA_CACHE.get(file_id, {})
     num_seats = sum(quota.get("rel_limits", {}).values())
-    if num_seats == 0: return None
+    if num_seats == 0: return None              #calculate the number of votes needed for a target group to gain a certain number of seats (target_k) in an election, based on the current election data and quota information. The function returns a dictionary with the results, including whether the group passed the electoral threshold, current seats, votes needed, and suggestions for achieving the desired seat gain.
 
     cache_id = (file_id, target_group, str(target_k), get_df_version(df))
-    if cache_id in SUGGESTION_CACHE: return SUGGESTION_CACHE[cache_id]
+    if cache_id in SUGGESTION_CACHE: return SUGGESTION_CACHE[cache_id]          #check if the result is already cached to avoid redundant calculations
 
     df_group = df.groupby("GROUP", as_index=False)["VOTES"].sum()
     valid_electoral = df_group["VOTES"].sum()
-    if valid_electoral == 0: return None
+    if valid_electoral == 0: return None            #check if there are any valid votes in the election data; if not, return None
 
     eq1 = valid_electoral / num_seats
-    df_group["USED"] = (df_group["VOTES"] >= eq1).astype(int)
+    df_group["USED"] = (df_group["VOTES"] >= eq1).astype(int)               #mark groups that have passed the electoral threshold based on the electoral quotient (eq1)
     unused_votes = df_group.loc[df_group["USED"] == 0, "VOTES"].sum()
     adjusted_electoral = valid_electoral - unused_votes
-    if adjusted_electoral <= 0: return None
+    if adjusted_electoral <= 0: return None             #check if there are any votes left after excluding unused groups; if not, return None
 
     eq2 = adjusted_electoral / num_seats
     df_adj = df_group[df_group["USED"] == 1].copy()
@@ -627,18 +627,18 @@ def calculate_votes_needed_for_one_group(file_id, df, target_group, target_k):
     df_adj["INITIAL_SEATS"] = df_adj["QUOTIENT"].apply(lambda x: math.floor(round(x, 3)))
     df_adj["ADVANTAGE"] = df_adj["QUOTIENT"] - df_adj["INITIAL_SEATS"]
     seats_left = int(num_seats - df_adj["INITIAL_SEATS"].sum())
-    df_adj = df_adj.sort_values(by="ADVANTAGE", ascending=False).reset_index(drop=True)
+    df_adj = df_adj.sort_values(by="ADVANTAGE", ascending=False).reset_index(drop=True)             #sort the adjusted groups by their advantage to determine which groups are closest to gaining additional seats
 
     df_adj["EXTRA_SEATS"] = 0
     for i in range(min(seats_left, len(df_adj))): df_adj.loc[i, "EXTRA_SEATS"] = 1
-    group_seats_won = dict(zip(df_adj["GROUP"], df_adj["INITIAL_SEATS"] + df_adj["EXTRA_SEATS"]))
+    group_seats_won = dict(zip(df_adj["GROUP"], df_adj["INITIAL_SEATS"] + df_adj["EXTRA_SEATS"]))               #create a dictionary mapping each group to the total number of seats they have won based on their initial seats and any extra seats they may have gained
 
     row = df_group[df_group["GROUP"] == target_group]
     if row.empty: return None
 
     v, passed = row.iloc[0]["VOTES"], row.iloc[0]["USED"] == 1
     current_seats_actual = int(get_current_group_seats(file_id, df).get(target_group, 0))
-    current_seats_formula = int(group_seats_won.get(target_group, 0)) if passed else 0
+    current_seats_formula = int(group_seats_won.get(target_group, 0)) if passed else 0                      #calculate the current number of seats won by the target group based on both the actual election results and the formula used to determine seat allocation
 
     k = int(target_k)
     if current_seats_formula + k > num_seats: return None
@@ -654,7 +654,7 @@ def calculate_votes_needed_for_one_group(file_id, df, target_group, target_k):
         needed = eq1 - v if k == 1 else (k * eq1) - v
     else:
         needed = ((current_seats_formula + k - 1 + cutoff_remainder) * eq2) - v
-    needed = int(max(1, math.ceil(needed)))
+    needed = int(max(1, math.ceil(needed)))                                             #calculate the number of additional votes needed for the target group to gain the desired number of seats (k), taking into account whether the group has passed the electoral threshold and the current seat allocation
 
     atomic_swaps = build_atomic_swaps_for_group(df, target_group)
     suggestions = []
@@ -663,7 +663,7 @@ def calculate_votes_needed_for_one_group(file_id, df, target_group, target_k):
         for s in atomic_swaps[:5]:
             sim = simulate_combo_gain(file_id, df, target_group, [s], current_seats_actual)
             if sim and sim["seat_gain"] >= 1:
-                suggestions.append({"type": "1_swap", "seat_gain": sim["seat_gain"], "total_gain": s["net_gain"], "swaps": [s]})
+                suggestions.append({"type": "1_swap", "seat_gain": sim["seat_gain"], "total_gain": s["net_gain"], "swaps": [s]})        #simulate the effect of each atomic swap on the number of seats won by the target group and add valid suggestions to the list
     else:
         combo_size = min(k, 3)
         tested = 0
@@ -676,11 +676,11 @@ def calculate_votes_needed_for_one_group(file_id, df, target_group, target_k):
             sim = simulate_combo_gain(file_id, df, target_group, combo, current_seats_actual)
             if sim and sim["seat_gain"] >= k:
                 suggestions.append({"type": f"{combo_size}_swap", "seat_gain": sim["seat_gain"], "total_gain": total_gain, "swaps": list(combo)})
-        suggestions = sorted(suggestions, key=lambda x: (x["total_gain"], len(x["swaps"])))[:5]
+        suggestions = sorted(suggestions, key=lambda x: (x["total_gain"], len(x["swaps"])))[:5]         #sort the suggestions by total gain and number of swaps, and keep only the top 5 suggestions
 
     result = {"passed": bool(passed), "current_seats": current_seats_actual, "votes": needed, "suggestions": suggestions}
-    SUGGESTION_CACHE[cache_id] = result
-    return result
+    SUGGESTION_CACHE[cache_id] = result 
+    return result                       
 
 
 # =========================================================
@@ -688,16 +688,16 @@ def calculate_votes_needed_for_one_group(file_id, df, target_group, target_k):
 # =========================================================
 def safe_sheet_name(name: str) -> str:
     cleaned = re.sub(r"[\\/*?:\[\]]", "_", str(name or "Sheet"))[:31]
-    return cleaned or "Sheet"
+    return cleaned or "Sheet"       #return a safe sheet name for Excel by replacing invalid characters and limiting the length to 31 characters
 
 def safe_download_name(name: str) -> str:
-    return re.sub(r"[^A-Za-z0-9_-]+", "_", str(name or "election_report")).strip("_")
+    return re.sub(r"[^A-Za-z0-9_-]+", "_", str(name or "election_report")).strip("_")           #return a safe download name for files by replacing invalid characters with underscores and stripping leading/trailing underscores
 
 def get_region_by_file_id(file_id: str):
     for slug, info in REGION_MAP.items():
         if file_id in info.get("files", {}).values():
             return slug, info
-    return None, None
+    return None, None           #return the region slug and info dictionary for a given file_id by searching through the REGION_MAP; return (None, None) if not found
 
 def build_report_tables(file_id: str):
     df = get_candidates_df(file_id)
@@ -730,7 +730,7 @@ def build_report_tables(file_id: str):
         "list_summary": list_summary,
         "district_summary": district_summary,
         "winners": winners,
-    }
+    }                                               #return a dictionary containing DataFrames for candidates, list summary, district summary, and winners for a given file_id; return None if the candidates DataFrame is not available
 
 def make_compare_payload(slug: str):
     if slug not in REGION_MAP:
