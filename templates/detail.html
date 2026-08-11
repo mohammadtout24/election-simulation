@@ -174,8 +174,8 @@
         <div class="d-flex align-items-center gap-2">
             <a href="/region/{{ region_slug }}?year=2018" class="btn btn-{{ 'primary' if current_year == '2018' else 'outline-primary' }} btn-sm fw-bold px-3">2018</a>
             <a href="/region/{{ region_slug }}?year=2022" class="btn btn-{{ 'primary' if current_year == '2022' else 'outline-primary' }} btn-sm fw-bold px-3">2022</a>
-            <a href="/compare/{{ region_slug }}" class="btn btn-outline-success btn-sm fw-bold px-3" data-i18n="compare_years">Compare 2018/2022</a>
-            <button class="btn btn-outline-warning btn-sm fw-bold px-3" onclick="openScenarioComparison()" data-i18n="scenario_compare">Scenario Comparison</button>
+            <!-- <a href="/compare/{{ region_slug }}" class="btn btn-outline-success btn-sm fw-bold px-3" data-i18n="compare_years">Compare 2018/2022</a> -->
+            <!-- <button class="btn btn-outline-warning btn-sm fw-bold px-3" onclick="openScenarioComparison()" data-i18n="scenario_compare">Scenario Comparison</button> -->
             <a href="/?year={{ current_year }}" class="btn btn-outline-dark btn-sm" data-i18n="back">← Back</a>
         </div>
     </div>
@@ -448,7 +448,7 @@
         <div class="modal-content border-0 shadow-lg">
             <div class="modal-header bg-warning">
                 <div>
-                    <h5 class="modal-title fw-bold mb-0" data-i18n="scenario_compare">Scenario Comparison</h5>
+                    <!-- <h5 class="modal-title fw-bold mb-0" data-i18n="scenario_compare">Scenario Comparison</h5> -->
                     <small class="text-dark" data-i18n="scenario_subtitle">Original database result vs current simulated result</small>
                 </div>
                 <button type="button" class="btn-close" data-bs-dismiss="modal" aria-label="Close"></button>
