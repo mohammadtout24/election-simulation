@@ -849,7 +849,10 @@ def simulate_combo_gain(file_id: str, df: pd.DataFrame, target_group: str, combo
 def calculate_votes_needed_for_one_group(file_id, df, target_group, target_k):
     quota = get_quota(file_id)
     num_seats = sum(quota.get("rel_limits", {}).values())
-    if num_seats == 0: return None              #calculate the number of votes needed for a target group to gain a certain number of seats (target_k) in an election, based on the current election data and quota information. The function returns a dictionary with the results, including whether the group passed the electoral threshold, current seats, votes needed, and suggestions for achieving the desired seat gain.
+    if num_seats == 0: return None
+
+    cache_id = (file_id, target_group, str(target_k), get_df_version(df))
+    if cache_id in SUGGESTION_CACHE: return SUGGESTION_CACHE[cache_id]
 
     df_group = df.groupby("GROUP", as_index=False)["VOTES"].sum()
     valid_electoral = df_group["VOTES"].sum()
@@ -919,7 +922,8 @@ def calculate_votes_needed_for_one_group(file_id, df, target_group, target_k):
         suggestions = sorted(suggestions, key=lambda x: (x["total_gain"], len(x["swaps"])))[:5]         #sort the suggestions by total gain and number of swaps, and keep only the top 5 suggestions
 
     result = {"passed": bool(passed), "current_seats": current_seats_actual, "votes": needed, "suggestions": suggestions}
-    return result                       
+    SUGGESTION_CACHE[cache_id] = result
+    return result
 
 
 # =========================================================
@@ -933,14 +937,10 @@ def safe_download_name(name: str) -> str:
     return re.sub(r"[^A-Za-z0-9_-]+", "_", str(name or "election_report")).strip("_")           #return a safe download name for files by replacing invalid characters with underscores and stripping leading/trailing underscores
 
 def get_region_by_file_id(file_id: str):
-    year, district_code = parse_file_id(file_id)
-    if year is None:
-        return None, None
-    regions = [r for r in load_regions_from_database() if r["district_code"] == district_code]
-    if not regions:
-        return None, None
-    info = regions[0]
-    return info["slug"], info
+    for slug, info in REGION_MAP.items():
+        if file_id in info.get("files", {}).values():
+            return slug, info
+    return None, None
 
 def build_report_tables(file_id: str):
     df = get_candidates_df(file_id)
