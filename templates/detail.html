@@ -172,6 +172,7 @@
         <div class="d-flex align-items-center gap-2">
             <a href="/region/{{ region_slug }}?year=2018" class="btn btn-{{ 'primary' if current_year == '2018' else 'outline-primary' }} btn-sm fw-bold px-3">2018</a>
             <a href="/region/{{ region_slug }}?year=2022" class="btn btn-{{ 'primary' if current_year == '2022' else 'outline-primary' }} btn-sm fw-bold px-3">2022</a>
+            <button id="langToggleBtn" type="button" class="btn btn-outline-primary btn-sm fw-bold px-3" onclick="toggleLanguage()">العربية</button>
 
             <!--
             <a href="/compare/{{ region_slug }}" class="btn btn-outline-success btn-sm fw-bold px-3" data-i18n="compare_years">Compare 2018/2022</a>
@@ -463,6 +464,7 @@
 </div>
 
 <script src="https://cdn.jsdelivr.net/npm/bootstrap@5.1.3/dist/js/bootstrap.bundle.min.js"></script>
+<script src="{{ url_for('static', filename='js/i18n.js') }}"></script>
 
 <script>
     const filename = "{{ file_id }}";
