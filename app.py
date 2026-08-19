@@ -805,18 +805,17 @@ def group_seat_map(df: pd.DataFrame) -> dict:
 def summarize_groups_for_compare(original_df: pd.DataFrame, current_df: pd.DataFrame):
     groups = sorted(set(original_df["GROUP"].astype(str).unique()).union(set(current_df["GROUP"].astype(str).unique())))
     original_seats = group_seat_map(original_df)
-    current_winners = _compute_winners_from_quota("__tmp__", current_df) if False else set(current_df[current_df["IS_WINNER"] == True]["MEMBER"].astype(str))
     current_seats = group_seat_map(current_df)
     rows = []
-    for g in groups:
-        ov = int(original_df[original_df["GROUP"].astype(str) == g]["VOTES"].sum())
-        cv = int(current_df[current_df["GROUP"].astype(str) == g]["VOTES"].sum())
-        os = int(original_seats.get(g, 0))
-        cs = int(current_seats.get(g, 0))
+    for grp in groups:
+        ov = int(original_df[original_df["GROUP"].astype(str) == grp]["VOTES"].sum())
+        cv = int(current_df[current_df["GROUP"].astype(str) == grp]["VOTES"].sum())
+        original_seat_count = int(original_seats.get(grp, 0))
+        current_seat_count = int(current_seats.get(grp, 0))
         rows.append({
-            "group": g, "original_votes": ov, "current_votes": cv,
-            "vote_change": cv - ov, "original_seats": os, "current_seats": cs,
-            "seat_change": cs - os
+            "group": grp, "original_votes": ov, "current_votes": cv,
+            "vote_change": cv - ov, "original_seats": original_seat_count, "current_seats": current_seat_count,
+            "seat_change": current_seat_count - original_seat_count
         })
     rows.sort(key=lambda r: (r["seat_change"], r["current_votes"]), reverse=True)
     return rows
@@ -888,9 +887,6 @@ def calculate_votes_needed_for_one_group(file_id, df, target_group, target_k):
     num_seats = sum(quota.get("rel_limits", {}).values())
     if num_seats == 0: return None
 
-    cache_id = (file_id, target_group, str(target_k), get_df_version(df))
-    if cache_id in SUGGESTION_CACHE: return SUGGESTION_CACHE[cache_id]
-
     df_group = df.groupby("GROUP", as_index=False)["VOTES"].sum()
     valid_electoral = df_group["VOTES"].sum()
     if valid_electoral == 0: return None            #check if there are any valid votes in the election data; if not, return None
@@ -958,9 +954,7 @@ def calculate_votes_needed_for_one_group(file_id, df, target_group, target_k):
                 suggestions.append({"type": f"{combo_size}_swap", "seat_gain": sim["seat_gain"], "total_gain": total_gain, "swaps": list(combo)})
         suggestions = sorted(suggestions, key=lambda x: (x["total_gain"], len(x["swaps"])))[:5]         #sort the suggestions by total gain and number of swaps, and keep only the top 5 suggestions
 
-    result = {"passed": bool(passed), "current_seats": current_seats_actual, "votes": needed, "suggestions": suggestions}
-    SUGGESTION_CACHE[cache_id] = result
-    return result
+    return {"passed": bool(passed), "current_seats": current_seats_actual, "votes": needed, "suggestions": suggestions}
 
 
 # =========================================================
@@ -974,9 +968,9 @@ def safe_download_name(name: str) -> str:
     return re.sub(r"[^A-Za-z0-9_-]+", "_", str(name or "election_report")).strip("_")           #return a safe download name for files by replacing invalid characters with underscores and stripping leading/trailing underscores
 
 def get_region_by_file_id(file_id: str):
-    for slug, info in REGION_MAP.items():
-        if file_id in info.get("files", {}).values():
-            return slug, info
+    for region in load_regions_from_database():
+        if file_id in region.get("files", {}).values():
+            return region["slug"], region
     return None, None
 
 def build_report_tables(file_id: str):
@@ -1154,7 +1148,7 @@ def region_detail(slug):
 
     grouped = {}
     for c in candidates: grouped.setdefault(c["group"], []).append(c)
-    for g in grouped: grouped[g].sort(key=lambda x: x["votes"], reverse=True)
+    for grp in grouped: grouped[grp].sort(key=lambda x: x["votes"], reverse=True)
     grouped = dict(sorted(grouped.items(), key=lambda i: sum(x["votes"] for x in i[1]), reverse=True))
 
     charts_by_district = {}
@@ -1429,13 +1423,6 @@ def api_reset_results():
         reset_result = reset_groups_db(file_id)
         winners = recompute_winners(file_id)
 
-        # Suggestions can depend on the current list assignments, so invalidate
-        # them after a reset when the cache exists.
-        try:
-            SUGGESTION_CACHE.clear()
-        except Exception:
-            pass
-
         removed_lists = reset_result.get("removed_custom_lists", [])
         if removed_lists:
             message = (
@@ -1544,7 +1531,6 @@ def api_what_if_advisor():
         swings.append({"percent": pct, "seats_after": after, "seat_gain": after - baseline})
 
     target_df = df[df["GROUP"] == target_group].copy().sort_values("VOTES", ascending=False)
-    winners_df = target_df[target_df["MEMBER"].astype(str).isin(current_winners)]
     non_winners_df = target_df[~target_df["MEMBER"].astype(str).isin(current_winners)]
 
     best_candidate = None
@@ -1583,39 +1569,6 @@ def api_what_if_advisor():
         "summary": summary
     })
 
-@app.route("/api/analyze_virtual_list", methods=["POST"])
-def analyze_virtual_list():
-    data = request.json or {}
-    file_id = data.get("filename")
-    selected = data.get("candidates", [])
-    df = get_candidates_df(file_id)
-    quota = get_quota(file_id)
-    num_seats = sum(quota.get("rel_limits", {}).values())
-
-    if df is None or df.empty or num_seats == 0:
-        return jsonify({"success": False, "message": "Election data is unavailable."}), 400
-
-    selected_names = []
-    for candidate in selected:
-        if isinstance(candidate, dict) and candidate.get("name"):
-            selected_names.append(str(candidate["name"]))
-        elif isinstance(candidate, str):
-            selected_names.append(candidate)
-    selected_names = list(dict.fromkeys(selected_names))
-    if not selected_names:
-        return jsonify({"success": False, "message": "Choose at least one candidate."}), 400
-
-    selected_df = df[df["MEMBER"].astype(str).isin(selected_names)]
-    total_votes = int(selected_df["VOTES"].sum())
-    quotient = float(df["VOTES"].sum()) / num_seats
-
-    return jsonify({
-        "success": True,
-        "total_votes": total_votes,
-        "quotient": int(quotient),
-        "reaches_quotient": total_votes >= quotient,
-        "matched_candidates": int(selected_df["MEMBER"].nunique()),
-    })
 @app.route("/api/change_candidate_group", methods=["POST"])
 def change_candidate_group():
     data = request.json or {}
