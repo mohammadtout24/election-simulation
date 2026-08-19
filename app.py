@@ -500,14 +500,51 @@ def reset_groups_db(file_id: str):
     year, district_code = parse_file_id(file_id)
     if year is None:
         raise ValueError("Invalid election identifier.")
+
     with DB_ENGINE.begin() as conn:
+        # Detect lists that exist only in the current scenario and were therefore
+        # created by the user. Original lists are stored in original_group_name.
+        custom_lists = conn.execute(text("""
+            SELECT DISTINCT group_name
+            FROM election_members
+            WHERE year = :year
+              AND district_code = :district_code
+              AND group_name IS NOT NULL
+              AND TRIM(group_name) <> ''
+              AND group_name NOT IN (
+                  SELECT DISTINCT original_group_name
+                  FROM election_members
+                  WHERE year = :year
+                    AND district_code = :district_code
+                    AND original_group_name IS NOT NULL
+                    AND TRIM(original_group_name) <> ''
+              )
+            ORDER BY group_name
+        """), {
+            "year": year,
+            "district_code": district_code,
+        }).scalars().all()
+
+        # Move every changed candidate back to the immutable/original list.
+        # Once no candidate belongs to a user-created group_name, that custom
+        # list disappears automatically because lists are derived from candidates.
         result = conn.execute(text("""
             UPDATE election_members
-            SET group_name = COALESCE(original_group_name, group_name),
+            SET group_name = original_group_name,
                 updated_at = NOW()
-            WHERE year = :year AND district_code = :district_code
-        """), {"year": year, "district_code": district_code})
-    return int(result.rowcount or 0)
+            WHERE year = :year
+              AND district_code = :district_code
+              AND original_group_name IS NOT NULL
+              AND group_name IS DISTINCT FROM original_group_name
+        """), {
+            "year": year,
+            "district_code": district_code,
+        })
+
+    return {
+        "updated_candidates": int(result.rowcount or 0),
+        "removed_custom_lists": [str(name) for name in custom_lists],
+    }
 
 # =========================================================
 #  CORE DATA LOGIC
@@ -1379,19 +1416,46 @@ def export_report(file_id, fmt):
 
 @app.route("/api/reset_results", methods=["POST"])
 def api_reset_results():
-    file_id = (request.json or {}).get("filename")
+    data = request.json or {}
+    file_id = data.get("filename")
+
+    if not file_id:
+        return jsonify({
+            "success": False,
+            "message": "Election identifier is required."
+        }), 400
+
     try:
-        updated = reset_groups_db(file_id)
+        reset_result = reset_groups_db(file_id)
         winners = recompute_winners(file_id)
+
+        # Suggestions can depend on the current list assignments, so invalidate
+        # them after a reset when the cache exists.
+        try:
+            SUGGESTION_CACHE.clear()
+        except Exception:
+            pass
+
+        removed_lists = reset_result.get("removed_custom_lists", [])
+        if removed_lists:
+            message = (
+                "Scenario reset successfully. "
+                f"{len(removed_lists)} user-created list(s) removed."
+            )
+        else:
+            message = "Scenario reset successfully to the original lists."
+
         return jsonify({
             "success": True,
-            "message": "Database scenario reset to the original lists.",
-            "updated_candidates": updated,
+            "message": message,
+            "updated_candidates": reset_result["updated_candidates"],
+            "removed_custom_lists": removed_lists,
             "winner_count": len(winners),
         })
     except ValueError as exc:
         return jsonify({"success": False, "message": str(exc)}), 400
     except Exception as exc:
+        print(f"Reset error: {exc}")
         return jsonify({"success": False, "message": f"Database reset failed: {exc}"}), 500
 
 @app.route("/api/get_votes_needed", methods=["POST"])
