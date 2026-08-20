@@ -44,8 +44,6 @@
         .list-header { background: #0d6efd; color: white; padding: 8px 12px; font-size: 0.9rem; font-weight: bold; border-radius: 6px 6px 0 0; }
         .sortable-list { height: 450px; overflow-y: auto; background: #fff; border: 1px solid #dee2e6; border-top: none; padding: 8px; border-radius: 0 0 6px 6px; min-height: 100px; }
 
-        /* Virtual List Builder Specific */
-        .virtual-builder { border: 2px dashed #0d6efd; background: #f0f7ff; border-radius: 10px; margin-bottom: 20px; }
         .add-btn { cursor: pointer; color: #0d6efd; font-weight: bold; border: 1px solid #0d6efd; border-radius: 4px; padding: 0 6px; transition: all 0.2s; }
         .add-btn:hover { background: #0d6efd; color: white; }
 
@@ -174,8 +172,13 @@
         <div class="d-flex align-items-center gap-2">
             <a href="/region/{{ region_slug }}?year=2018" class="btn btn-{{ 'primary' if current_year == '2018' else 'outline-primary' }} btn-sm fw-bold px-3">2018</a>
             <a href="/region/{{ region_slug }}?year=2022" class="btn btn-{{ 'primary' if current_year == '2022' else 'outline-primary' }} btn-sm fw-bold px-3">2022</a>
-            <!-- <a href="/compare/{{ region_slug }}" class="btn btn-outline-success btn-sm fw-bold px-3" data-i18n="compare_years">Compare 2018/2022</a>
-            <button class="btn btn-outline-warning btn-sm fw-bold px-3" onclick="openScenarioComparison()" data-i18n="scenario_compare">Scenario Comparison</button> -->
+            <button id="langToggleBtn" type="button" class="btn btn-outline-primary btn-sm fw-bold px-3" onclick="toggleLanguage()">العربية</button>
+
+            <!--
+            <a href="/compare/{{ region_slug }}" class="btn btn-outline-success btn-sm fw-bold px-3" data-i18n="compare_years">Compare 2018/2022</a>
+            <button class="btn btn-outline-warning btn-sm fw-bold px-3" onclick="openScenarioComparison()" data-i18n="scenario_compare">Scenario Comparison</button>
+            -->
+
             <a href="/?year={{ current_year }}" class="btn btn-outline-dark btn-sm" data-i18n="back">← Back</a>
         </div>
     </div>
@@ -448,7 +451,7 @@
         <div class="modal-content border-0 shadow-lg">
             <div class="modal-header bg-warning">
                 <div>
-                    <h5 class="modal-title fw-bold mb-0" data-i18n="scenario_compare">Scenario Comparison</h5>
+                    <!-- <h5 class="modal-title fw-bold mb-0" data-i18n="scenario_compare">Scenario Comparison</h5> -->
                     <small class="text-dark" data-i18n="scenario_subtitle">Original database result vs current simulated result</small>
                 </div>
                 <button type="button" class="btn-close" data-bs-dismiss="modal" aria-label="Close"></button>
@@ -461,6 +464,7 @@
 </div>
 
 <script src="https://cdn.jsdelivr.net/npm/bootstrap@5.1.3/dist/js/bootstrap.bundle.min.js"></script>
+<script src="{{ url_for('static', filename='js/i18n.js') }}"></script>
 
 <script>
     const filename = "{{ file_id }}";
@@ -688,50 +692,6 @@
         saveChatHistory();
     }
 
-    // --- VIRTUAL LIST BUILDER LOGIC ---
-    let virtualList = [];
-
-    function addToVirtualList(name, votes, rel) {
-        if (virtualList.find(x => x.name === name)) return;
-        virtualList.push({name, votes, rel});
-        renderVirtualList();
-    }
-
-    function renderVirtualList() {
-        const container = document.getElementById("virtual-container");
-        if (virtualList.length === 0) {
-            container.innerHTML = '<span class="text-muted small">Click the <b>+</b> on candidate cards below to test if a custom alliance reaches the electoral quotient.</span>';
-            return;
-        }
-        container.innerHTML = virtualList.map(c => `
-            <div class="badge bg-white text-dark border p-2 shadow-sm d-flex align-items-center gap-2">
-                <div><b>${c.name}</b> <br> <span class="fw-normal text-muted">${c.votes.toLocaleString()} votes</span></div>
-                <span class="text-danger fs-5" style="cursor:pointer" onclick="removeFromVirtual('${c.name}')">&times;</span>
-            </div>
-        `).join('');
-    }
-
-    function removeFromVirtual(name) {
-        virtualList = virtualList.filter(x => x.name !== name);
-        renderVirtualList();
-    }
-
-    function clearVirtualList() { 
-        virtualList = []; 
-        renderVirtualList(); 
-    }
-
-    async function analyzeVirtualList() {
-        if (virtualList.length === 0) return;
-        const res = await fetch("/api/analyze_virtual_list", {
-            method: "POST", headers: {"Content-Type": "application/json"},
-            body: JSON.stringify({ filename, candidates: virtualList })
-        });
-        const data = await res.json();
-        const status = data.reaches_quotient ? '✅ Hit Quotient' : '❌ Failed Quotient';
-        addLogMessage(`<strong>${status}:</strong> Virtual List total is <b>${data.total_votes.toLocaleString()}</b>. Needed <b>${data.quotient.toLocaleString()}</b>.`, data.reaches_quotient ? 'log-success' : 'log-info');
-    }
-
     // --- WINNING LIST ADVISOR ---
     async function findWinningList() {
         const candidateName = document.getElementById("candidateAdvisor").value;
@@ -863,38 +823,6 @@
     document.querySelectorAll('.sortable-list').forEach(el => {
         new Sortable(el, { group: 'shared', animation: 150, swap: true, swapClass: 'selected', onEnd: handleDrop });
     });
-
-    function addNewList() {
-        const input = document.getElementById('newListName');
-        const listName = input.value.trim();
-        if (!listName) return;
-
-        const safeId = listName.replace(/[\s\.]/g, '_');
-        if (document.getElementById('list-' + safeId)) {
-            alert('لائحة بهذا الاسم موجودة مسبقاً!');
-            return;
-        }
-
-        const container = document.getElementById('lists-container');
-        const col = document.createElement('div');
-        col.className = 'col';
-        
-        col.innerHTML = `
-            <div class="card border-primary shadow-sm">
-                <div class="list-header d-flex justify-content-between align-items-center" style="background-color: #0dcaf0; color: #000;">
-                    <div class="text-truncate fw-bold">${listName}</div>
-                    <span class="badge bg-white text-dark" id="total-${safeId}">0</span>
-                </div>
-                <div class="sortable-list bg-light" id="list-${safeId}" data-group="${listName}"></div>
-            </div>
-        `;
-        
-        container.insertBefore(col, container.firstChild);
-        new Sortable(document.getElementById('list-' + safeId), { group: 'shared', animation: 150, swap: true, swapClass: 'selected', onEnd: handleDrop });
-        
-        input.value = '';
-        addLogMessage(`<strong>✨ لائحة جديدة:</strong> تم إنشاء <b>${listName}</b> بنجاح.`, 'log-info');
-    }
 
     // --- QUOTA CALCULATOR LOGIC ---
     let currentVotesNeeded = {};

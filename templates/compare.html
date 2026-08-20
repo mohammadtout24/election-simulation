@@ -27,6 +27,7 @@
         <div class="d-flex gap-2">
             <a href="/region/{{ slug }}?year=2018" class="btn btn-outline-primary fw-bold" data-i18n="open2018">Open 2018</a>
             <a href="/region/{{ slug }}?year=2022" class="btn btn-primary fw-bold" data-i18n="open2022">Open 2022</a>
+            <button id="langToggleBtn" type="button" class="btn btn-outline-primary fw-bold" onclick="toggleLanguage()">العربية</button>
             <a href="/?year=2022" class="btn btn-outline-dark" data-i18n="map">← Map</a>
         </div>
     </div>
@@ -137,6 +138,7 @@
     </div>
 </div>
 
+<script src="{{ url_for('static', filename='js/i18n.js') }}"></script>
 <script>
     const compareChart = {{ chart_json | safe }};
     if (compareChart && compareChart.data) {

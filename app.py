@@ -1,4 +1,4 @@
-from flask import Flask, render_template, abort, request, jsonify, send_file
+from flask import Flask, render_template, abort, request, jsonify, send_file, g
 import pandas as pd
 import json
 import os
@@ -7,7 +7,7 @@ import math
 import difflib
 from io import BytesIO
 from datetime import datetime
-from sqlalchemy import create_engine, text
+from sqlalchemy import create_engine, text, bindparam
 import geopandas as gpd
 import plotly.express as px
 import plotly
@@ -16,11 +16,6 @@ import plotly.utils
 from itertools import combinations
 
 app = Flask(__name__)
-
-# --- GLOBAL CACHE ---
-DATA_CACHE = {}   # {file_id: df_final}
-QUOTA_CACHE = {}  # {file_id: {'rel_limits': {(dist, rel): count}, 'dist_totals': {dist: count}}}
-SUGGESTION_CACHE = {}  # {(file_id, group_name, target_k, version): result}
 
 # --- COLORS (Matching the requested map) ---
 REGION_COLORS = {
@@ -36,94 +31,74 @@ REGION_COLORS = {
 }
 DEFAULT_COLOR = "#bdc3c7"
 
-# --- MAPPING ---
-DISTRICT_MAPPING = {
-    "Beirut-one": "Beirut1_result", "Beirut-two": "Beirut2_result", "Jbayl": "Mount1_result",
-    "Kesrouan": "Mount1_result", "Matn": "Mount2_result", "Baabda": "Mount3_result",
-    "Aley": "Mount4_result", "Chouf": "Mount4_result", "Akkar": "North1_result",
-    "Tripoli": "North2_result", "Minieh-Dannieh": "North2_result", "Miniyeh-Danniyeh": "North2_result",
-    "Zgharta": "North3_result", "Bcharreh": "North3_result", "Koura": "North3_result",
-    "Batroun": "North3_result", "Zahleh": "Bekaa1_result", "WestBekaa-Rachaya": "Bekaa2_result",
-    "Baalbek-Hermel": "Bekaa3_result", "Saida": "South1_result", "Jezzine": "South1_result",
-    "Zahrany": "South2_result", "Sour": "South2_result", "Nabatiyeh": "South3_result",
-    "Marjayoun-Hasbaya": "South3_result", "Bent Jbayl": "South3_result",
-}
-
-REGION_MAP = {}
-GDF_GLOBAL = None
-
-# --- PATH SETUP ---
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
-MAP_DIR = os.path.join(BASE_DIR, "data")
-YEAR_DIRS = {
-    "2018": os.path.join(BASE_DIR, "2018"),
-    "2022": os.path.join(BASE_DIR, "2022"),
-}
-
 
 # --- POSTGRESQL SETUP ---
-# The application now reads election result data from PostgreSQL.
-# Set DATABASE_URL in your terminal, or keep the default local database below.
+# Every runtime feature reads from and writes to PostgreSQL.
+# File generation is used only by the Excel/PDF export endpoints.
 DATABASE_URL = os.environ.get(
     "DATABASE_URL",
     "postgresql+psycopg2://postgres:lims@localhost:5432/election_db"
 )
-DB_ENGINE = create_engine(DATABASE_URL, pool_pre_ping=True)
+DB_ENGINE = create_engine(DATABASE_URL, pool_pre_ping=True, future=True)
 
 
 # =========================================================
-#  HELPER FUNCTIONS
+#  DATABASE + HELPER FUNCTIONS
 # =========================================================
-def clean_text(text):
-    if not isinstance(text, str): return ""
-    return re.sub(r"\s+", " ", text.strip()).lower()
-
-def normalize_slug(text):
-    text = str(text).lower().strip()
-    text = re.sub(r"[^a-z0-9]+", "_", text)
-    return text.strip("_")
-
-def format_district_name(base_filename):
-    if not base_filename: return "Unknown"
-    base = base_filename.split("_")[0]
-    return re.sub(r"([a-zA-Z])(\d)", r"\1 \2", base)
-
-def district_code_from_base_key(base_key: str):
-    if not base_key: return None
-    return base_key.split("_")[0]
-
-def cache_key(year: str, district_code: str) -> str:
-    return f"{year}:{district_code}"
-
-def district_files(year: str, district_code: str) -> dict:
-    root = os.path.join(YEAR_DIRS[str(year)], str(district_code))
-    return {
-        "members": os.path.join(root, f"{district_code}_members.xlsx"),
-        "seats": os.path.join(root, f"{district_code}_seats.xlsx"),
-        "data": os.path.join(root, f"{district_code}_data.xlsx"),
-    }
+def election_id(year: str, district_code: str) -> str:
+    # Kept as the public identifier used by the frontend and export URLs.
+    # It no longer points to a file or an in-memory cache.
+    return f"{int(year)}:{str(district_code).strip()}"
 
 
-def database_has_district(year: str, district_code: str) -> bool:
-    """Return True when the selected year/district exists in PostgreSQL."""
+def parse_file_id(file_id: str):
+    if not file_id or ":" not in str(file_id):
+        return None, None
+    year_text, district_code = str(file_id).split(":", 1)
     try:
-        with DB_ENGINE.connect() as conn:
-            q = text("""
-                SELECT
-                    (SELECT COUNT(*) FROM election_members WHERE year = :year AND district_code = :district_code) AS members_count,
-                    (SELECT COUNT(*) FROM election_votes   WHERE year = :year AND district_code = :district_code) AS votes_count,
-                    (SELECT COUNT(*) FROM election_seats   WHERE year = :year AND district_code = :district_code) AS seats_count
-            """)
-            row = conn.execute(q, {"year": int(year), "district_code": district_code}).mappings().first()
-            return bool(row and row["members_count"] > 0 and row["votes_count"] > 0 and row["seats_count"] > 0)
-    except Exception as e:
-        print(f"❌ Database check failed for {year}:{district_code}: {e}")
-        return False
+        year = int(year_text)
+    except (TypeError, ValueError):
+        return None, None
+    district_code = district_code.strip()
+    return (year, district_code) if district_code else (None, None)
 
 
-def load_tables_from_database(year: str, district_code: str):
-    """Load seats, members, and votes from PostgreSQL and return DataFrames using the old column names."""
+def _request_dict(name: str):
+    """Small request-local cache for immutable quota metadata only."""
+    try:
+        value = getattr(g, name, None)
+        if value is None:
+            value = {}
+            setattr(g, name, value)
+        return value
+    except RuntimeError:
+        # Allows helper functions to be called from a Flask shell/test without
+        # an active request context. PostgreSQL remains the source of truth.
+        return None
+
+
+def _std_cols(df: pd.DataFrame) -> pd.DataFrame:
+    df = df.copy()
+    df.columns = [str(c).strip().upper() for c in df.columns]
+    return df
+
+
+def _pick(df: pd.DataFrame, names):
+    for name in names:
+        if name in df.columns:
+            return name
+    return None
+
+
+def _norm_name(value) -> str:
+    return re.sub(r"\s+", " ", str(value or "").strip()).lower()
+
+
+def load_tables_from_database(year: str, district_code: str, baseline: bool = False):
+    """Load seats, candidates, and aggregated votes from PostgreSQL."""
     params = {"year": int(year), "district_code": district_code}
+    group_expression = "COALESCE(original_group_name, group_name)" if baseline else "group_name"
     try:
         with DB_ENGINE.connect() as conn:
             seats_df = pd.read_sql(text("""
@@ -133,11 +108,11 @@ def load_tables_from_database(year: str, district_code: str):
                 ORDER BY id
             """), conn, params=params)
 
-            members_df = pd.read_sql(text("""
+            members_df = pd.read_sql(text(f"""
                 SELECT
                     CAST(candidate_id AS TEXT) AS "CANDIDATE_ID",
                     member AS "MEMBER",
-                    group_name AS "GROUP",
+                    {group_expression} AS "GROUP",
                     religion AS "RELIGION",
                     district AS "DISTRICT"
                 FROM election_members
@@ -154,160 +129,439 @@ def load_tables_from_database(year: str, district_code: str):
                 WHERE year = :year AND district_code = :district_code
                 GROUP BY candidate_id, member
             """), conn, params=params)
-
         return seats_df, members_df, data_df
-    except Exception as e:
-        print(f"❌ Database load failed for {year}:{district_code}: {e}")
+    except Exception as exc:
+        print(f"Database load failed for {year}:{district_code}: {exc}")
         return None, None, None
 
-def _std_cols(df: pd.DataFrame) -> pd.DataFrame:
-    df = df.copy()
-    df.columns = [str(c).strip().upper() for c in df.columns]
-    return df
 
-def _pick(df: pd.DataFrame, names):
-    for n in names:
-        if n in df.columns: return n
+def _quota_from_seats(seats_df: pd.DataFrame) -> dict:
+    rel_limits = {}
+    dist_totals = {}
+    if seats_df is None or seats_df.empty:
+        return {"rel_limits": rel_limits, "dist_totals": dist_totals}
+
+    normalized = _std_cols(seats_df).rename(columns={
+        "REGION": "DISTRICT", "QADA": "DISTRICT",
+        "SECT": "RELIGION", "CONFESSION": "RELIGION"
+    })
+    if "DISTRICT" in normalized.columns and "RELIGION" in normalized.columns:
+        for _, row in normalized.iterrows():
+            district = str(row.get("DISTRICT", "")).strip()
+            religion = str(row.get("RELIGION", "")).strip()
+            if not district or not religion:
+                continue
+            rel_limits[(district, religion)] = rel_limits.get((district, religion), 0) + 1
+            dist_totals[district] = dist_totals.get(district, 0) + 1
+    return {"rel_limits": rel_limits, "dist_totals": dist_totals}
+
+
+def _store_request_quota(file_id: str, quota: dict):
+    request_cache = _request_dict("quota_cache")
+    if request_cache is not None:
+        request_cache[file_id] = quota
+
+
+def get_quota(file_id: str) -> dict:
+    request_cache = _request_dict("quota_cache")
+    if request_cache is not None and file_id in request_cache:
+        return request_cache[file_id]
+
+    year, district_code = parse_file_id(file_id)
+    if year is None:
+        return {"rel_limits": {}, "dist_totals": {}}
+    try:
+        with DB_ENGINE.connect() as conn:
+            seats_df = pd.read_sql(text("""
+                SELECT district AS "DISTRICT", religion AS "RELIGION"
+                FROM election_seats
+                WHERE year = :year AND district_code = :district_code
+                ORDER BY id
+            """), conn, params={"year": year, "district_code": district_code})
+        quota = _quota_from_seats(seats_df)
+        _store_request_quota(file_id, quota)
+        return quota
+    except Exception as exc:
+        print(f"Quota load failed for {file_id}: {exc}")
+        return {"rel_limits": {}, "dist_totals": {}}
+
+
+def load_regions_from_database():
+    """Load map geometry and year availability from PostgreSQL."""
+    sql = text("""
+        WITH members_available AS (
+            SELECT DISTINCT year, district_code FROM election_members
+        ), votes_available AS (
+            SELECT DISTINCT year, district_code FROM election_votes
+        ), seats_available AS (
+            SELECT DISTINCT year, district_code FROM election_seats
+        ), available AS (
+            SELECT m.year, m.district_code
+            FROM members_available m
+            INNER JOIN votes_available v USING (year, district_code)
+            INNER JOIN seats_available s USING (year, district_code)
+        )
+        SELECT
+            r.slug, r.name, r.district_code, r.district_label,
+            r.geometry, r.display_order, a.year
+        FROM election_regions r
+        LEFT JOIN available a ON a.district_code = r.district_code
+        WHERE r.active = TRUE
+        ORDER BY r.display_order, r.id, a.year
+    """)
+    try:
+        with DB_ENGINE.connect() as conn:
+            rows = conn.execute(sql).mappings().all()
+    except Exception as exc:
+        print(f"Region load failed: {exc}")
+        return []
+
+    by_slug = {}
+    for row in rows:
+        slug = str(row["slug"])
+        region = by_slug.setdefault(slug, {
+            "name": str(row["name"]),
+            "slug": slug,
+            "district_code": str(row["district_code"]),
+            "district_label": str(row["district_label"] or row["district_code"]),
+            "geometry": row["geometry"],
+            "display_order": int(row["display_order"] or 0),
+            "files": {},
+        })
+        if row["year"] is not None:
+            year = str(int(row["year"]))
+            region["files"][year] = election_id(year, region["district_code"])
+    return list(by_slug.values())
+
+
+def get_region_from_database(slug: str):
+    for region in load_regions_from_database():
+        if region["slug"] == slug:
+            return region
     return None
 
-def _norm_name(x) -> str:
-    return re.sub(r"\s+", " ", str(x or "").strip()).lower()
 
-def clear_all_suggestion_cache():
-    SUGGESTION_CACHE.clear()
-
-def get_df_version(df: pd.DataFrame) -> int:
-    return hash(tuple(df["GROUP"].astype(str).tolist()))
-
-# =========================================================
-#  MAP LOAD
-# =========================================================
-def load_and_prepare_map():
-    global REGION_MAP, GDF_GLOBAL
-    REGION_MAP = {}
-
-    map_file_path = os.path.join(MAP_DIR, "lebanonmap.xlsx")
-    if not os.path.exists(map_file_path):
-        print(f"❌ Missing map file: {map_file_path}")
-        GDF_GLOBAL = None
-        return
-
-    df_map = pd.read_excel(map_file_path)
-    features = []
-
-    for _, row in df_map.iterrows():
-        try:
-            map_name = str(row["DISTRICT"]).strip()
-            slug = normalize_slug(map_name)
-
-            if slug == "beirut_three":
-                slug = "beirut_two"
-                map_name = "Beirut-two"
-
-            base_file_key = DISTRICT_MAPPING.get(map_name)
-            district_label = "Unknown"
-            files_available = {}
-
-            if base_file_key:
-                district_label = format_district_name(base_file_key)
-                dcode = district_code_from_base_key(base_file_key)
-
-                if dcode:
-                    for y in ["2018", "2022"]:
-                        if database_has_district(y, dcode):
-                            files_available[y] = cache_key(y, dcode)
-
-            REGION_MAP[slug] = {
-                "name": map_name,
-                "slug": slug,
-                "files": files_available,
-                "district_label": district_label,
-            }
-
-            geometry = json.loads(row["geometry"])
-            features.append({
-                "type": "Feature",
-                "id": slug,
-                "geometry": geometry,
-                "properties": {"slug": slug, "name": map_name}
-            })
-        except Exception:
-            pass
-
-    if not features:
-        GDF_GLOBAL = None
-        return
-
-    geojson_obj = {"type": "FeatureCollection", "features": features}
-    GDF_GLOBAL = gpd.GeoDataFrame.from_features(geojson_obj)
-    GDF_GLOBAL["slug"] = [f["id"] for f in features]
-
-load_and_prepare_map()
-
-def create_interactive_map(target_slugs, selected_year):
-    if GDF_GLOBAL is None or GDF_GLOBAL.empty:
+def create_interactive_map(regions, selected_year):
+    if not regions:
         return "{}"
 
-    gdf = GDF_GLOBAL[GDF_GLOBAL["slug"].isin(target_slugs)].copy()
+    features = []
+    for region in regions:
+        geometry = region.get("geometry")
+        if isinstance(geometry, str):
+            try:
+                geometry = json.loads(geometry)
+            except json.JSONDecodeError:
+                continue
+        if not isinstance(geometry, dict):
+            continue
+        features.append({
+            "type": "Feature",
+            "id": region["slug"],
+            "geometry": geometry,
+            "properties": {
+                "slug": region["slug"],
+                "name": region["name"],
+                "district_code": region["district_code"],
+            },
+        })
 
-    color_map = {slug: REGION_COLORS.get(slug, DEFAULT_COLOR) for slug in gdf["slug"]}
-    gdf["color_code"] = gdf["slug"].map(color_map)
+    if not features:
+        return "{}"
 
-    voters_data = []
-    district_names = []
+    try:
+        gdf = gpd.GeoDataFrame.from_features(features)
+    except Exception as exc:
+        print(f"Map geometry error: {exc}")
+        return "{}"
 
-    for slug in gdf["slug"]:
-        d_name = REGION_MAP[slug]["district_label"] if slug in REGION_MAP else slug
-        district_names.append(d_name)
+    region_by_slug = {region["slug"]: region for region in regions}
+    district_codes = sorted({region["district_code"] for region in regions})
+    totals = {}
+    if district_codes:
+        stmt = text("""
+            SELECT district_code, COALESCE(SUM(votes), 0)::bigint AS total_votes
+            FROM election_votes
+            WHERE year = :year AND district_code IN :district_codes
+            GROUP BY district_code
+        """).bindparams(bindparam("district_codes", expanding=True))
+        try:
+            with DB_ENGINE.connect() as conn:
+                rows = conn.execute(stmt, {
+                    "year": int(selected_year),
+                    "district_codes": district_codes,
+                }).mappings().all()
+            totals = {str(row["district_code"]): int(row["total_votes"] or 0) for row in rows}
+        except Exception as exc:
+            print(f"Map vote totals failed: {exc}")
 
-        total = 0
-        if slug in REGION_MAP:
-            file_id = REGION_MAP[slug]["files"].get(selected_year)
-            if file_id:
-                df = get_candidates_df(file_id)
-                if df is not None and "VOTES" in df.columns:
-                    total = df["VOTES"].sum()
+    gdf["District"] = [region_by_slug[str(slug)]["district_label"] for slug in gdf["slug"]]
+    gdf["Data Available"] = [
+        "Yes" if selected_year in region_by_slug[str(slug)]["files"] else "No"
+        for slug in gdf["slug"]
+    ]
+    gdf["Total Voters"] = [
+        f"{totals.get(region_by_slug[str(slug)]['district_code'], 0):,}"
+        if selected_year in region_by_slug[str(slug)]["files"]
+        else "No data"
+        for slug in gdf["slug"]
+    ]
+    color_map = {str(slug): REGION_COLORS.get(str(slug), DEFAULT_COLOR) for slug in gdf["slug"]}
 
-        voters_data.append(f"{int(total):,}")
-
-    gdf["District"] = district_names
-    gdf["Total Voters"] = voters_data
     geojson = json.loads(gdf.to_json())
-
     fig = px.choropleth(
-        gdf, geojson=geojson, locations="slug", featureidkey="properties.slug",
-        color="slug", color_discrete_map=color_map, hover_name="District",
-        hover_data={"slug": False, "color_code": False, "District": False, "Total Voters": True}
+        gdf,
+        geojson=geojson,
+        locations="slug",
+        featureidkey="properties.slug",
+        color="slug",
+        color_discrete_map=color_map,
+        hover_name="District",
+        hover_data={
+            "slug": False,
+            "District": False,
+            "Total Voters": True,
+            "Data Available": True,
+        },
     )
-
     fig.update_traces(marker_line_width=1, marker_line_color="black")
     fig.update_geos(fitbounds="locations", visible=False, bgcolor="rgba(0,0,0,0)")
     fig.update_layout(
-        margin={"r": 0, "t": 0, "l": 0, "b": 0}, showlegend=False,
-        paper_bgcolor="rgba(0,0,0,0)", plot_bgcolor="rgba(0,0,0,0)", dragmode=False
+        margin={"r": 0, "t": 0, "l": 0, "b": 0},
+        showlegend=False,
+        paper_bgcolor="rgba(0,0,0,0)",
+        plot_bgcolor="rgba(0,0,0,0)",
+        dragmode=False,
     )
-
     return json.dumps(fig, cls=plotly.utils.PlotlyJSONEncoder)
+
+
+def persist_winner_flags(file_id: str, winners: set):
+    year, district_code = parse_file_id(file_id)
+    if year is None:
+        return
+    winner_names = sorted({str(name) for name in winners})
+    with DB_ENGINE.begin() as conn:
+        conn.execute(text("""
+            UPDATE election_members
+            SET is_winner = FALSE, updated_at = NOW()
+            WHERE year = :year AND district_code = :district_code
+        """), {"year": year, "district_code": district_code})
+        if winner_names:
+            stmt = text("""
+                UPDATE election_members
+                SET is_winner = TRUE, updated_at = NOW()
+                WHERE year = :year AND district_code = :district_code
+                  AND member IN :winner_names
+            """).bindparams(bindparam("winner_names", expanding=True))
+            conn.execute(stmt, {
+                "year": year,
+                "district_code": district_code,
+                "winner_names": winner_names,
+            })
+
+
+def update_candidate_group_db(file_id: str, candidate_name: str, new_group: str):
+    year, district_code = parse_file_id(file_id)
+    if year is None or not candidate_name or not str(new_group).strip():
+        raise ValueError("Invalid election, candidate, or list.")
+    with DB_ENGINE.begin() as conn:
+        row = conn.execute(text("""
+            SELECT group_name
+            FROM election_members
+            WHERE year = :year AND district_code = :district_code AND member = :member
+            ORDER BY id
+            LIMIT 1
+            FOR UPDATE
+        """), {"year": year, "district_code": district_code, "member": candidate_name}).mappings().first()
+        if row is None:
+            raise LookupError(f"Candidate {candidate_name} not found.")
+        old_group = str(row["group_name"])
+        conn.execute(text("""
+            UPDATE election_members
+            SET group_name = :new_group, updated_at = NOW()
+            WHERE year = :year AND district_code = :district_code AND member = :member
+        """), {
+            "new_group": str(new_group).strip(), "year": year,
+            "district_code": district_code, "member": candidate_name,
+        })
+    return old_group
+
+
+def swap_candidate_groups_db(file_id: str, source_name: str, target_name: str):
+    year, district_code = parse_file_id(file_id)
+    if year is None or not source_name or not target_name or source_name == target_name:
+        raise ValueError("Choose two different candidates.")
+
+    stmt = text("""
+        SELECT member, group_name, religion, district
+        FROM election_members
+        WHERE year = :year AND district_code = :district_code
+          AND member IN :names
+        ORDER BY id
+        FOR UPDATE
+    """).bindparams(bindparam("names", expanding=True))
+
+    with DB_ENGINE.begin() as conn:
+        rows = conn.execute(stmt, {
+            "year": year, "district_code": district_code,
+            "names": [source_name, target_name],
+        }).mappings().all()
+        by_name = {str(row["member"]): row for row in rows}
+        if source_name not in by_name or target_name not in by_name:
+            raise LookupError("One or both candidates were not found.")
+        source = by_name[source_name]
+        target = by_name[target_name]
+        if str(source["religion"]) != str(target["religion"]) or str(source["district"]) != str(target["district"]):
+            raise ValueError("Candidates must have the same religion and district.")
+
+        source_group = str(source["group_name"])
+        target_group = str(target["group_name"])
+        conn.execute(text("""
+            UPDATE election_members
+            SET group_name = CASE
+                WHEN member = :source_name THEN :target_group
+                WHEN member = :target_name THEN :source_group
+                ELSE group_name
+            END,
+            updated_at = NOW()
+            WHERE year = :year AND district_code = :district_code
+              AND member IN (:source_name, :target_name)
+        """), {
+            "source_name": source_name, "target_name": target_name,
+            "source_group": source_group, "target_group": target_group,
+            "year": year, "district_code": district_code,
+        })
+    return {
+        "source_group": source_group,
+        "target_group": target_group,
+        "religion": str(source["religion"]),
+        "district": str(source["district"]),
+    }
+
+
+def multi_swap_candidate_groups_db(file_id: str, swaps):
+    year, district_code = parse_file_id(file_id)
+    if year is None or not swaps:
+        raise ValueError("Invalid election identifier or empty swaps.")
+
+    with DB_ENGINE.begin() as conn:
+        rows = conn.execute(text("""
+            SELECT member, group_name, religion, district
+            FROM election_members
+            WHERE year = :year AND district_code = :district_code
+            ORDER BY id
+            FOR UPDATE
+        """), {"year": year, "district_code": district_code}).mappings().all()
+
+        state = {
+            str(row["member"]): {
+                "group": str(row["group_name"]),
+                "religion": str(row["religion"]),
+                "district": str(row["district"]),
+            }
+            for row in rows
+        }
+        original_groups = {name: item["group"] for name, item in state.items()}
+
+        for item in swaps:
+            source_name = str(item.get("out") or "").strip()
+            target_name = str(item.get("in") or "").strip()
+            if not source_name or not target_name or source_name == target_name:
+                raise ValueError("Every swap must contain two different candidates.")
+            if source_name not in state or target_name not in state:
+                raise LookupError("One or more candidates were not found.")
+            source = state[source_name]
+            target = state[target_name]
+            if source["religion"] != target["religion"] or source["district"] != target["district"]:
+                raise ValueError("Every swap must use candidates from the same religion and district.")
+            source["group"], target["group"] = target["group"], source["group"]
+
+        updates = [
+            {
+                "year": year,
+                "district_code": district_code,
+                "member": name,
+                "new_group": item["group"],
+            }
+            for name, item in state.items()
+            if original_groups.get(name) != item["group"]
+        ]
+        if updates:
+            conn.execute(text("""
+                UPDATE election_members
+                SET group_name = :new_group, updated_at = NOW()
+                WHERE year = :year AND district_code = :district_code AND member = :member
+            """), updates)
+    return len(updates)
+
+
+def reset_groups_db(file_id: str):
+    year, district_code = parse_file_id(file_id)
+    if year is None:
+        raise ValueError("Invalid election identifier.")
+
+    with DB_ENGINE.begin() as conn:
+        # Detect lists that exist only in the current scenario and were therefore
+        # created by the user. Original lists are stored in original_group_name.
+        custom_lists = conn.execute(text("""
+            SELECT DISTINCT group_name
+            FROM election_members
+            WHERE year = :year
+              AND district_code = :district_code
+              AND group_name IS NOT NULL
+              AND TRIM(group_name) <> ''
+              AND group_name NOT IN (
+                  SELECT DISTINCT original_group_name
+                  FROM election_members
+                  WHERE year = :year
+                    AND district_code = :district_code
+                    AND original_group_name IS NOT NULL
+                    AND TRIM(original_group_name) <> ''
+              )
+            ORDER BY group_name
+        """), {
+            "year": year,
+            "district_code": district_code,
+        }).scalars().all()
+
+        # Move every changed candidate back to the immutable/original list.
+        # Once no candidate belongs to a user-created group_name, that custom
+        # list disappears automatically because lists are derived from candidates.
+        result = conn.execute(text("""
+            UPDATE election_members
+            SET group_name = original_group_name,
+                updated_at = NOW()
+            WHERE year = :year
+              AND district_code = :district_code
+              AND original_group_name IS NOT NULL
+              AND group_name IS DISTINCT FROM original_group_name
+        """), {
+            "year": year,
+            "district_code": district_code,
+        })
+
+    return {
+        "updated_candidates": int(result.rowcount or 0),
+        "removed_custom_lists": [str(name) for name in custom_lists],
+    }
 
 # =========================================================
 #  CORE DATA LOGIC
 # =========================================================
-def get_candidates_df(file_id: str):
+def get_candidates_df(file_id: str, baseline: bool = False):
     """Return the candidate DataFrame for one year/district from PostgreSQL.
 
     Important: the rest of the app still receives the same DataFrame columns as before:
     MEMBER, GROUP, RELIGION, DISTRICT, VOTES, IS_WINNER.
     This means the UI, reports, comparison page, chat, and simulations keep working.
     """
-    if file_id in DATA_CACHE:
-        return DATA_CACHE[file_id]
-    if ":" not in str(file_id):
+    year, district_code = parse_file_id(file_id)
+    if year is None:
         return None
 
-    year, district_code = file_id.split(":", 1)
-
     try:
-        seats_df, members_df, data_df = load_tables_from_database(year, district_code)
+        seats_df, members_df, data_df = load_tables_from_database(year, district_code, baseline=baseline)
         if seats_df is None or members_df is None or data_df is None:
             return None
         if members_df.empty or seats_df.empty:
@@ -328,7 +582,7 @@ def get_candidates_df(file_id: str):
                 rel_limits[(d, r)] = rel_limits.get((d, r), 0) + 1
                 dist_totals[d] = dist_totals.get(d, 0) + 1
 
-        QUOTA_CACHE[file_id] = {"rel_limits": rel_limits, "dist_totals": dist_totals}
+        _store_request_quota(file_id, {"rel_limits": rel_limits, "dist_totals": dist_totals})
 
         members_df = _std_cols(members_df)
         m_id = _pick(members_df, ["CANDIDATE_ID", "CANDIDATEID", "ID", "CID"])
@@ -450,7 +704,6 @@ def get_candidates_df(file_id: str):
         winners = _compute_winners_from_quota(file_id, df_final)
         df_final["IS_WINNER"] = df_final["MEMBER"].astype(str).isin(winners)
 
-        DATA_CACHE[file_id] = df_final
         return df_final
 
     except Exception as e:
@@ -458,7 +711,7 @@ def get_candidates_df(file_id: str):
         return None
 
 def _compute_winners_from_quota(file_id: str, df: pd.DataFrame) -> set:
-    quota = QUOTA_CACHE.get(file_id, {})
+    quota = get_quota(file_id)
     rel_limits = quota.get("rel_limits", {})
 
     number_of_seats = sum(rel_limits.values())
@@ -532,23 +785,17 @@ def _compute_winners_from_quota(file_id: str, df: pd.DataFrame) -> set:
     return winners
 
 def recompute_winners(file_id: str) -> set:
-    if file_id not in DATA_CACHE: return set()
-    df = DATA_CACHE[file_id].copy()
+    df = get_candidates_df(file_id)
+    if df is None:
+        return set()
     winners = _compute_winners_from_quota(file_id, df)
-    DATA_CACHE[file_id]["IS_WINNER"] = DATA_CACHE[file_id]["MEMBER"].astype(str).isin(winners)
+    persist_winner_flags(file_id, winners)
     return winners
 
 def load_original_df(file_id: str):
-    """Load a fresh DB copy without using DATA_CACHE. Used for scenario comparison."""
-    if not file_id or ":" not in str(file_id):
-        return None
-    old_df = DATA_CACHE.pop(file_id, None)
-    try:
-        fresh = get_candidates_df(file_id)
-        return fresh.copy() if fresh is not None else None
-    finally:
-        if old_df is not None:
-            DATA_CACHE[file_id] = old_df
+    """Load the immutable baseline list assignments from PostgreSQL."""
+    df = get_candidates_df(file_id, baseline=True)
+    return df.copy() if df is not None else None
 
 def group_seat_map(df: pd.DataFrame) -> dict:
     if df is None or df.empty:
@@ -558,18 +805,17 @@ def group_seat_map(df: pd.DataFrame) -> dict:
 def summarize_groups_for_compare(original_df: pd.DataFrame, current_df: pd.DataFrame):
     groups = sorted(set(original_df["GROUP"].astype(str).unique()).union(set(current_df["GROUP"].astype(str).unique())))
     original_seats = group_seat_map(original_df)
-    current_winners = _compute_winners_from_quota("__tmp__", current_df) if False else set(current_df[current_df["IS_WINNER"] == True]["MEMBER"].astype(str))
     current_seats = group_seat_map(current_df)
     rows = []
-    for g in groups:
-        ov = int(original_df[original_df["GROUP"].astype(str) == g]["VOTES"].sum())
-        cv = int(current_df[current_df["GROUP"].astype(str) == g]["VOTES"].sum())
-        os = int(original_seats.get(g, 0))
-        cs = int(current_seats.get(g, 0))
+    for grp in groups:
+        ov = int(original_df[original_df["GROUP"].astype(str) == grp]["VOTES"].sum())
+        cv = int(current_df[current_df["GROUP"].astype(str) == grp]["VOTES"].sum())
+        original_seat_count = int(original_seats.get(grp, 0))
+        current_seat_count = int(current_seats.get(grp, 0))
         rows.append({
-            "group": g, "original_votes": ov, "current_votes": cv,
-            "vote_change": cv - ov, "original_seats": os, "current_seats": cs,
-            "seat_change": cs - os
+            "group": grp, "original_votes": ov, "current_votes": cv,
+            "vote_change": cv - ov, "original_seats": original_seat_count, "current_seats": current_seat_count,
+            "seat_change": current_seat_count - original_seat_count
         })
     rows.sort(key=lambda r: (r["seat_change"], r["current_votes"]), reverse=True)
     return rows
@@ -637,12 +883,9 @@ def simulate_combo_gain(file_id: str, df: pd.DataFrame, target_group: str, combo
     return {"seat_gain": int(seats_after - baseline_seats), "seats_after": seats_after}     #simulate the effect of a swap combo on the number of seats won by the target group and return the result
 
 def calculate_votes_needed_for_one_group(file_id, df, target_group, target_k):
-    quota = QUOTA_CACHE.get(file_id, {})
+    quota = get_quota(file_id)
     num_seats = sum(quota.get("rel_limits", {}).values())
-    if num_seats == 0: return None              #calculate the number of votes needed for a target group to gain a certain number of seats (target_k) in an election, based on the current election data and quota information. The function returns a dictionary with the results, including whether the group passed the electoral threshold, current seats, votes needed, and suggestions for achieving the desired seat gain.
-
-    cache_id = (file_id, target_group, str(target_k), get_df_version(df))
-    if cache_id in SUGGESTION_CACHE: return SUGGESTION_CACHE[cache_id]          #check if the result is already cached to avoid redundant calculations
+    if num_seats == 0: return None
 
     df_group = df.groupby("GROUP", as_index=False)["VOTES"].sum()
     valid_electoral = df_group["VOTES"].sum()
@@ -711,9 +954,7 @@ def calculate_votes_needed_for_one_group(file_id, df, target_group, target_k):
                 suggestions.append({"type": f"{combo_size}_swap", "seat_gain": sim["seat_gain"], "total_gain": total_gain, "swaps": list(combo)})
         suggestions = sorted(suggestions, key=lambda x: (x["total_gain"], len(x["swaps"])))[:5]         #sort the suggestions by total gain and number of swaps, and keep only the top 5 suggestions
 
-    result = {"passed": bool(passed), "current_seats": current_seats_actual, "votes": needed, "suggestions": suggestions}
-    SUGGESTION_CACHE[cache_id] = result 
-    return result                       
+    return {"passed": bool(passed), "current_seats": current_seats_actual, "votes": needed, "suggestions": suggestions}
 
 
 # =========================================================
@@ -727,10 +968,10 @@ def safe_download_name(name: str) -> str:
     return re.sub(r"[^A-Za-z0-9_-]+", "_", str(name or "election_report")).strip("_")           #return a safe download name for files by replacing invalid characters with underscores and stripping leading/trailing underscores
 
 def get_region_by_file_id(file_id: str):
-    for slug, info in REGION_MAP.items():
-        if file_id in info.get("files", {}).values():
-            return slug, info
-    return None, None           #return the region slug and info dictionary for a given file_id by searching through the REGION_MAP; return (None, None) if not found
+    for region in load_regions_from_database():
+        if file_id in region.get("files", {}).values():
+            return region["slug"], region
+    return None, None
 
 def build_report_tables(file_id: str):
     df = get_candidates_df(file_id)
@@ -766,10 +1007,10 @@ def build_report_tables(file_id: str):
     }                                               #return a dictionary containing DataFrames for candidates, list summary, district summary, and winners for a given file_id; return None if the candidates DataFrame is not available
 
 def make_compare_payload(slug: str):
-    if slug not in REGION_MAP:
+    info = get_region_from_database(slug)
+    if info is None:
         return None
 
-    info = REGION_MAP[slug]
     payload = {"region": info, "slug": slug, "years": {}, "groups": [], "winners": [], "chart_json": "{}"}
 
     for year in ["2018", "2022"]:
@@ -848,39 +1089,58 @@ def make_compare_payload(slug: str):
 # =========================================================
 @app.route("/")
 def index():
-    global GDF_GLOBAL
-    if GDF_GLOBAL is None: load_and_prepare_map()
-    if GDF_GLOBAL is None or GDF_GLOBAL.empty: return "Map file not loaded. Put lebanonmap.xlsx in ./data/lebanonmap.xlsx", 500
-
     selected_year = request.args.get("year", "2022")
-    unique_districts, seen_labels = [], set()
+    if selected_year not in {"2018", "2022"}:
+        selected_year = "2022"
 
-    for r in sorted(REGION_MAP.values(), key=lambda x: (x["district_label"], x["name"])):
-        label = r["district_label"]
-        if label == "Unknown" or "Beirut 3" in label or r["name"] == "Beirut-three": continue
-        if selected_year in r["files"]:
-            if label not in seen_labels:
-                seen_labels.add(label)
-                unique_districts.append({**r, "active_year": selected_year})
+    all_regions = load_regions_from_database()
+    if not all_regions:
+        return (
+            "Map data is missing from PostgreSQL. Run schema_postgres.sql and "
+            "the one-time migrations/import_map_to_postgres.py script.",
+            500,
+        )
+
+    # Always render every active map polygon so Lebanon keeps its complete shape.
+    # Only the sidebar/navigation is filtered to districts that have complete
+    # election data for the selected year.
+    map_regions = all_regions
+    available_regions = [
+        region for region in all_regions
+        if selected_year in region["files"]
+    ]
+
+    unique_districts, seen_labels = [], set()
+    for region in sorted(available_regions, key=lambda item: (item["district_label"], item["name"])):
+        label = region["district_label"]
+        if label == "Unknown" or "Beirut 3" in label or region["name"] == "Beirut-three":
+            continue
+        if label not in seen_labels:
+            seen_labels.add(label)
+            unique_districts.append({**region, "active_year": selected_year})
 
     return render_template(
         "index.html",
-        map_json=create_interactive_map(GDF_GLOBAL["slug"].tolist(), selected_year),
+        map_json=create_interactive_map(map_regions, selected_year),
         regions=unique_districts,
+        available_slugs=[region["slug"] for region in available_regions],
         current_year=selected_year,
     )
 
 @app.route("/region/<slug>")
 def region_detail(slug):
-    if slug not in REGION_MAP: return abort(404)
+    info = get_region_from_database(slug)
+    if info is None:
+        return abort(404)
     selected_year = request.args.get("year", "2022")
-    info = REGION_MAP[slug]
     file_id = info["files"].get(selected_year)
-    if not file_id: return "Data file not found."
+    if not file_id:
+        return "Election data not found in PostgreSQL.", 404
     df = get_candidates_df(file_id)
-    if df is None: return "Error loading Excel."
+    if df is None:
+        return "Error loading election data from PostgreSQL.", 500
 
-    total_seats = sum(QUOTA_CACHE.get(file_id, {}).get("rel_limits", {}).values())
+    total_seats = sum(get_quota(file_id).get("rel_limits", {}).values())
 
     df_agg = df.groupby("MEMBER", as_index=False).agg({"GROUP": "first", "RELIGION": "first", "DISTRICT": "first", "IS_WINNER": "max", "VOTES": "sum"})
     
@@ -888,7 +1148,7 @@ def region_detail(slug):
 
     grouped = {}
     for c in candidates: grouped.setdefault(c["group"], []).append(c)
-    for g in grouped: grouped[g].sort(key=lambda x: x["votes"], reverse=True)
+    for grp in grouped: grouped[grp].sort(key=lambda x: x["votes"], reverse=True)
     grouped = dict(sorted(grouped.items(), key=lambda i: sum(x["votes"] for x in i[1]), reverse=True))
 
     charts_by_district = {}
@@ -938,7 +1198,6 @@ def region_detail(slug):
         charts_by_district=charts_by_district, total_seats=total_seats,
         region_slug=slug, all_candidates=all_candidates_sorted
     )
-
 
 @app.route("/compare/<slug>")
 def compare_years(slug):
@@ -1151,24 +1410,60 @@ def export_report(file_id, fmt):
 
 @app.route("/api/reset_results", methods=["POST"])
 def api_reset_results():
-    file_id = (request.json or {}).get("filename")
-    if file_id in DATA_CACHE: del DATA_CACHE[file_id]
-    keys_to_del = [k for k in SUGGESTION_CACHE.keys() if k[0] == file_id]
-    for k in keys_to_del: del SUGGESTION_CACHE[k]
-    return jsonify({"success": True, "message": "Cache cleared."})
+    data = request.json or {}
+    file_id = data.get("filename")
+
+    if not file_id:
+        return jsonify({
+            "success": False,
+            "message": "Election identifier is required."
+        }), 400
+
+    try:
+        reset_result = reset_groups_db(file_id)
+        winners = recompute_winners(file_id)
+
+        removed_lists = reset_result.get("removed_custom_lists", [])
+        if removed_lists:
+            message = (
+                "Scenario reset successfully. "
+                f"{len(removed_lists)} user-created list(s) removed."
+            )
+        else:
+            message = "Scenario reset successfully to the original lists."
+
+        return jsonify({
+            "success": True,
+            "message": message,
+            "updated_candidates": reset_result["updated_candidates"],
+            "removed_custom_lists": removed_lists,
+            "winner_count": len(winners),
+        })
+    except ValueError as exc:
+        return jsonify({"success": False, "message": str(exc)}), 400
+    except Exception as exc:
+        print(f"Reset error: {exc}")
+        return jsonify({"success": False, "message": f"Database reset failed: {exc}"}), 500
 
 @app.route("/api/get_votes_needed", methods=["POST"])
 def api_get_votes_needed():
     data = request.json or {}
-    file_id, target_group, target_k = data.get("filename"), data.get("group_name"), str(data.get("target_k", "1"))
-    if not file_id or file_id not in DATA_CACHE: return jsonify({"success": False}), 400
-    return jsonify({"success": True, "result": calculate_votes_needed_for_one_group(file_id, DATA_CACHE[file_id], target_group, target_k)})
+    file_id = data.get("filename")
+    target_group = data.get("group_name")
+    target_k = str(data.get("target_k", "1"))
+    df = get_candidates_df(file_id)
+    if df is None or not target_group:
+        return jsonify({"success": False, "message": "Data not available."}), 400
+    return jsonify({
+        "success": True,
+        "result": calculate_votes_needed_for_one_group(file_id, df, target_group, target_k),
+    })
 
 @app.route("/api/scenario_comparison", methods=["POST"])
 def api_scenario_comparison():
     data = request.json or {}
     file_id = data.get("filename")
-    current_df = DATA_CACHE.get(file_id)
+    current_df = get_candidates_df(file_id)
     original_df = load_original_df(file_id)
     if current_df is None or original_df is None:
         return jsonify({"success": False, "message": "Data not available."}), 400
@@ -1214,7 +1509,7 @@ def api_what_if_advisor():
     data = request.json or {}
     file_id = data.get("filename")
     target_group = data.get("group_name")
-    df = DATA_CACHE.get(file_id)
+    df = get_candidates_df(file_id)
     if df is None or not target_group:
         return jsonify({"success": False, "message": "Choose a list first."}), 400
 
@@ -1236,7 +1531,6 @@ def api_what_if_advisor():
         swings.append({"percent": pct, "seats_after": after, "seat_gain": after - baseline})
 
     target_df = df[df["GROUP"] == target_group].copy().sort_values("VOTES", ascending=False)
-    winners_df = target_df[target_df["MEMBER"].astype(str).isin(current_winners)]
     non_winners_df = target_df[~target_df["MEMBER"].astype(str).isin(current_winners)]
 
     best_candidate = None
@@ -1275,91 +1569,95 @@ def api_what_if_advisor():
         "summary": summary
     })
 
-@app.route("/api/analyze_virtual_list", methods=["POST"])
-def analyze_virtual_list():
-    data = request.json or {}
-    file_id, selected = data.get("filename"), data.get("candidates", [])
-    df = DATA_CACHE.get(file_id)
-    quota = QUOTA_CACHE.get(file_id, {})
-    
-    if not df or not quota: return jsonify({"success": False})
-
-    total_votes = sum(int(c['votes']) for c in selected)
-    num_seats = sum(quota.get("rel_limits", {}).values())
-    quotient = df["VOTES"].sum() / num_seats if num_seats > 0 else 0
-    
-    return jsonify({
-        "success": True, "total_votes": total_votes,
-        "quotient": int(quotient), "reaches_quotient": total_votes >= quotient
-    })
-
 @app.route("/api/change_candidate_group", methods=["POST"])
 def change_candidate_group():
     data = request.json or {}
-    fid, src_name, new_group = data.get("filename"), data.get("candidate_name"), data.get("new_group")
-    df = DATA_CACHE.get(fid)
-    if df is None: return jsonify({"success": False, "message": "Data not found."}), 400
-
-    mask = df["MEMBER"] == src_name
-    if not mask.any(): return jsonify({"success": False, "message": f"Candidate {src_name} not found."}), 404
-
-    old_group = df.loc[mask, "GROUP"].values[0]
-    df.loc[mask, "GROUP"] = new_group
-    clear_all_suggestion_cache()
-
-    return jsonify({
-        "success": True, "candidate": src_name, "old_group": old_group, "new_group": new_group,
-        "old_total": int(df[df["GROUP"] == old_group]["VOTES"].sum()),
-        "new_total": int(df[df["GROUP"] == new_group]["VOTES"].sum())
-    })
+    file_id = data.get("filename")
+    candidate_name = data.get("candidate_name")
+    new_group = data.get("new_group")
+    try:
+        old_group = update_candidate_group_db(file_id, candidate_name, new_group)
+        recompute_winners(file_id)
+        df = get_candidates_df(file_id)
+        return jsonify({
+            "success": True,
+            "candidate": candidate_name,
+            "old_group": old_group,
+            "new_group": new_group,
+            "old_total": int(df[df["GROUP"] == old_group]["VOTES"].sum()),
+            "new_total": int(df[df["GROUP"] == new_group]["VOTES"].sum()),
+        })
+    except LookupError as exc:
+        return jsonify({"success": False, "message": str(exc)}), 404
+    except ValueError as exc:
+        return jsonify({"success": False, "message": str(exc)}), 400
+    except Exception as exc:
+        return jsonify({"success": False, "message": f"Database update failed: {exc}"}), 500
 
 @app.route("/api/swap_candidates", methods=["POST"])
 def swap_candidates():
-    # Left intact for multi-swap backwards compatibility if needed
     data = request.json or {}
-    fid, src_name, target_name = data.get("filename"), data.get("candidate_name"), data.get("target_name")
-    df = DATA_CACHE.get(fid)
-    src_idx, target_idx = df.index[df["MEMBER"] == src_name][0], df.index[df["MEMBER"] == target_name][0]
-    
-    if df.at[src_idx, "RELIGION"] != df.at[target_idx, "RELIGION"] or df.at[src_idx, "DISTRICT"] != df.at[target_idx, "DISTRICT"]:
-        return jsonify({"success": False, "message": "لا يمكن التبادل لاختلاف الطائفة أو الدائرة."}), 400
-
-    sg, tg = df.at[src_idx, "GROUP"], df.at[target_idx, "GROUP"]
-    df.loc[df["MEMBER"] == src_name, "GROUP"], df.loc[df["MEMBER"] == target_name, "GROUP"] = tg, sg
-    clear_all_suggestion_cache()
-
-    return jsonify({
-        "success": True, "src_name": src_name, "target_name": target_name, "src_group": sg, "target_group": tg,
-        "src_total": int(df[df["GROUP"] == sg]["VOTES"].sum()), "target_total": int(df[df["GROUP"] == tg]["VOTES"].sum()),
-        "src_group_id": sg.replace(" ", "_").replace(".", ""), "target_group_id": tg.replace(" ", "_").replace(".", ""),
-    })
+    file_id = data.get("filename")
+    source_name = data.get("candidate_name")
+    target_name = data.get("target_name")
+    try:
+        swap = swap_candidate_groups_db(file_id, source_name, target_name)
+        recompute_winners(file_id)
+        df = get_candidates_df(file_id)
+        source_group = swap["source_group"]
+        target_group = swap["target_group"]
+        return jsonify({
+            "success": True,
+            "src_name": source_name,
+            "target_name": target_name,
+            "src_group": source_group,
+            "target_group": target_group,
+            "src_total": int(df[df["GROUP"] == source_group]["VOTES"].sum()),
+            "target_total": int(df[df["GROUP"] == target_group]["VOTES"].sum()),
+            "src_group_id": source_group.replace(" ", "_").replace(".", ""),
+            "target_group_id": target_group.replace(" ", "_").replace(".", ""),
+        })
+    except LookupError as exc:
+        return jsonify({"success": False, "message": str(exc)}), 404
+    except ValueError as exc:
+        return jsonify({"success": False, "message": str(exc)}), 400
+    except Exception as exc:
+        return jsonify({"success": False, "message": f"Database swap failed: {exc}"}), 500
 
 @app.route("/api/multi_swap_candidates", methods=["POST"])
 def multi_swap_candidates():
     data = request.json or {}
-    file_id, swaps = data.get("filename"), data.get("swaps", [])
-    df = DATA_CACHE.get(file_id)
-    if not df is None and swaps:
-        for s in swaps:
-            s_rows, t_rows = df.index[df["MEMBER"] == s["out"]], df.index[df["MEMBER"] == s["in"]]
-            sg, tg = df.loc[s_rows[0], "GROUP"], df.loc[t_rows[0], "GROUP"]
-            df.loc[s_rows, "GROUP"], df.loc[t_rows, "GROUP"] = tg, sg
-        clear_all_suggestion_cache()
-        return jsonify({"success": True})
-    return jsonify({"success": False}), 400
-
+    file_id = data.get("filename")
+    swaps = data.get("swaps", [])
+    try:
+        updated = multi_swap_candidate_groups_db(file_id, swaps)
+        recompute_winners(file_id)
+        return jsonify({"success": True, "updated_candidates": updated})
+    except LookupError as exc:
+        return jsonify({"success": False, "message": str(exc)}), 404
+    except ValueError as exc:
+        return jsonify({"success": False, "message": str(exc)}), 400
+    except Exception as exc:
+        return jsonify({"success": False, "message": f"Database multi-swap failed: {exc}"}), 500
 @app.route("/api/recompute_results", methods=["POST"])
 def api_recompute_results():
     file_id = (request.json or {}).get("filename")
-    winners = recompute_winners(file_id)
-    return jsonify({"success": True, "winner_names": sorted(list(winners)), "winner_count": len(winners)})
+    try:
+        winners = recompute_winners(file_id)
+        return jsonify({
+            "success": True,
+            "winner_names": sorted(winners),
+            "winner_count": len(winners),
+        })
+    except Exception as exc:
+        return jsonify({"success": False, "message": f"Recalculation failed: {exc}"}), 500
 
 @app.route("/api/find_winning_list", methods=["POST"])
 def api_find_winning_list():
     data = request.json or {}
     fid = data.get("filename")
     candidate_name = data.get("candidate_name")
-    df = DATA_CACHE.get(fid)
+    df = get_candidates_df(fid)
     
     if df is None or not candidate_name:
         return jsonify({"success": False, "message": "بيانات غير متوفرة."}), 400
@@ -1448,7 +1746,7 @@ def api_find_winning_list():
 def api_chat():
     data = request.json or {}
     msg, fid = str(data.get("message", "")).strip(), data.get("filename")
-    df = DATA_CACHE.get(fid)
+    df = get_candidates_df(fid)
     if df is None:
         return jsonify({"reply": "عذراً، البيانات غير متوفرة حالياً.", "action": "none"})
 
@@ -1496,20 +1794,22 @@ def api_chat():
                     "action": "none"
                 })
 
-            # Perform the swap
+            # Persist the swap in PostgreSQL.
             sg, tg = str(src_row["GROUP"]), str(tgt_row["GROUP"])
-            df.loc[df["MEMBER"] == src_name, "GROUP"] = tg
-            df.loc[df["MEMBER"] == tgt_name, "GROUP"] = sg
-            clear_all_suggestion_cache()
+            try:
+                swap_candidate_groups_db(fid, src_name, tgt_name)
+                recompute_winners(fid)
+            except Exception as exc:
+                return jsonify({"reply": f"❌ فشل تحديث قاعدة البيانات: {exc}", "action": "none"})
 
             return jsonify({
-                "reply": f"✅ تم التبادل بنجاح!<br><b>{src_name}</b> ← {tg}<br><b>{tgt_name}</b> ← {sg}<br><br><i>اضغط \"Recalculate\" لتحديث النتائج.</i>",
+                "reply": f"✅ تم التبادل وحفظه في قاعدة البيانات!<br><b>{src_name}</b> ← {tg}<br><b>{tgt_name}</b> ← {sg}",
                 "action": "swap_done"
             })
 
     # --- 2) QUOTIENT QUERY ---
     if "حاصل" in msg:
-        num_seats = sum(QUOTA_CACHE.get(fid, {}).get("rel_limits", {}).values())
+        num_seats = sum(get_quota(fid).get("rel_limits", {}).values())
         if num_seats == 0:
             return jsonify({"reply": "لا توجد بيانات مقاعد.", "action": "none"})
         eq1 = df["VOTES"].sum() / num_seats
@@ -1582,7 +1882,7 @@ def api_chat():
 
     # --- 5) SUMMARY COMMAND: "ملخص" ---
     if any(w in msg for w in ["ملخص", "summary", "توزيع", "إحصائيات"]):
-        num_seats = sum(QUOTA_CACHE.get(fid, {}).get("rel_limits", {}).values())
+        num_seats = sum(get_quota(fid).get("rel_limits", {}).values())
         total_votes = int(df["VOTES"].sum())
         total_candidates = len(df)
         groups = df["GROUP"].unique()
@@ -1656,7 +1956,7 @@ def api_chat():
                 grp_df = df[df["GROUP"] == grp].sort_values("VOTES", ascending=False)
                 total = int(grp_df["VOTES"].sum())
                 winners_count = int(grp_df["IS_WINNER"].sum())
-                num_seats = sum(QUOTA_CACHE.get(fid, {}).get("rel_limits", {}).values())
+                num_seats = sum(get_quota(fid).get("rel_limits", {}).values())
                 eq = total / max(1, num_seats) if num_seats > 0 else 0
 
                 html = f"<div style='font-size:0.82rem;'>"
