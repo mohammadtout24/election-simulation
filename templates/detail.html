@@ -41,6 +41,8 @@
         .candidate-card.winner-card { background-color: #e8f5e9; border-left: 4px solid #2e7d32; color: #1b5e20; }
         .candidate-card.loser-card { background-color: #ffffff; border-left: 4px solid #ced4da; }
         .badge-winner { background-color: #2e7d32; color: white; font-size: 0.6rem; padding: 1px 5px; border-radius: 3px; font-weight: bold; margin-top: 4px; display: inline-block; }
+        .swap-hint { cursor: pointer; margin-top: 3px; font-size: 0.65rem; font-weight: 700; color: #b8860b; background: #fff8e1; border: 1px solid #f0d264; border-radius: 4px; padding: 1px 5px; display: inline-block; white-space: nowrap; }
+        .swap-hint:hover { background: #ffecb3; color: #7a5c00; }
         .list-header { background: #0d6efd; color: white; padding: 8px 12px; font-size: 0.9rem; font-weight: bold; border-radius: 6px 6px 0 0; }
         .sortable-list { height: 450px; overflow-y: auto; background: #fff; border: 1px solid #dee2e6; border-top: none; padding: 8px; border-radius: 0 0 6px 6px; min-height: 100px; }
 
@@ -172,14 +174,13 @@
         <div class="d-flex align-items-center gap-2">
             <a href="/region/{{ region_slug }}?year=2018" class="btn btn-{{ 'primary' if current_year == '2018' else 'outline-primary' }} btn-sm fw-bold px-3">2018</a>
             <a href="/region/{{ region_slug }}?year=2022" class="btn btn-{{ 'primary' if current_year == '2022' else 'outline-primary' }} btn-sm fw-bold px-3">2022</a>
-            <button id="langToggleBtn" type="button" class="btn btn-outline-primary btn-sm fw-bold px-3" onclick="toggleLanguage()">العربية</button>
+            <a href="/compare/{{ region_slug }}" class="btn btn-outline-success btn-sm fw-bold px-3">Compare 2018/2022</a>
 
             <!--
-            <a href="/compare/{{ region_slug }}" class="btn btn-outline-success btn-sm fw-bold px-3" data-i18n="compare_years">Compare 2018/2022</a>
-            <button class="btn btn-outline-warning btn-sm fw-bold px-3" onclick="openScenarioComparison()" data-i18n="scenario_compare">Scenario Comparison</button>
+            <button class="btn btn-outline-warning btn-sm fw-bold px-3" onclick="openScenarioComparison()">Scenario Comparison</button>
             -->
 
-            <a href="/?year={{ current_year }}" class="btn btn-outline-dark btn-sm" data-i18n="back">← Back</a>
+            <a href="/?year={{ current_year }}" class="btn btn-outline-dark btn-sm">← Back</a>
         </div>
     </div>
 
@@ -206,10 +207,10 @@
     <hr class="my-4">
 
     <div class="d-flex justify-content-center mb-4 gap-3 flex-wrap">
-        <button class="btn btn-success px-5 fw-bold" id="btnRecalc" onclick="recalcResults()" data-i18n="recalculate">Recalculate Results</button>
-        <a class="btn btn-outline-primary px-4 export-btn" href="/api/export_report/{{ file_id }}/xlsx" data-i18n="export_excel">Export Excel</a>
-        <a class="btn btn-outline-secondary px-4 export-btn" href="/api/export_report/{{ file_id }}/pdf" data-i18n="export_pdf">Export PDF</a>
-        <button class="btn btn-outline-danger px-4 fw-bold" id="btnReset" onclick="resetDefaultResults()" data-i18n="reset">Reset to Default</button>
+        <button class="btn btn-success px-5 fw-bold" id="btnRecalc" onclick="recalcResults()">Recalculate Results</button>
+        <a class="btn btn-outline-primary px-4 export-btn" href="/api/export_report/{{ file_id }}/xlsx">Export Excel</a>
+        <a class="btn btn-outline-secondary px-4 export-btn" href="/api/export_report/{{ file_id }}/pdf">Export PDF</a>
+        <button class="btn btn-outline-danger px-4 fw-bold" id="btnReset" onclick="resetDefaultResults()">Reset to Default</button>
     </div>
 
     <div class="row">
@@ -264,15 +265,15 @@
             <div class="search-toolbar">
                 <div class="row g-2 align-items-center">
                     <div class="col-md-8">
-                        <input id="candidateSearch" class="form-control" type="search" placeholder="Search candidate, list, religion, or district..." data-i18n-placeholder="candidate_search" oninput="filterCandidatesAndLists()">
+                        <input id="candidateSearch" class="form-control" type="search" placeholder="Search candidate, list, religion, or district..." oninput="filterCandidatesAndLists()">
                     </div>
                     <div class="col-md-4 text-md-end text-muted small">
-                        <span id="candidateSearchCount" data-i18n="showing_all">Showing all candidates</span>
+                        <span id="candidateSearchCount">Showing all candidates</span>
                     </div>
                 </div>
             </div>
 
-            <h5 class="fw-bold mb-3 text-center text-md-start" data-i18n="live_standings">Live List Standings</h5>
+            <h5 class="fw-bold mb-3 text-center text-md-start">Live List Standings</h5>
             <div class="row row-cols-1 row-cols-md-2 row-cols-xl-3 g-3 pb-3" id="lists-container">
                 {% for group_name, candidates in groups.items() %}
                 {% set total_votes = candidates|sum(attribute='votes') %}
@@ -299,7 +300,12 @@
                                             {% if c.is_winner %}<span class="badge-winner">WINNER</span>{% endif %}
                                         </div>
                                     </div>
-                                    <div class="text-end"><span class="fw-bold">{{ c.votes }}</span></div>
+                                    <div class="text-end">
+                                        <span class="fw-bold">{{ c.votes }}</span>
+                                        {% if not c.is_winner and c.name in swap_hints %}
+                                        <div class="swap-hint" title="Swap in {{ swap_hints[c.name]['in'] }} from {{ swap_hints[c.name]['from_list'] }} (+{{ swap_hints[c.name]['net_gain'] }} votes)" onclick="event.stopPropagation(); applySwapHint('{{ c.name }}', '{{ swap_hints[c.name]['in'] }}')">⇄ +{{ swap_hints[c.name]['net_gain'] }}</div>
+                                        {% endif %}
+                                    </div>
                                 </div>
                             </div>
                             {% endfor %}
@@ -338,19 +344,19 @@
 
             <!-- <div class="card advisor-card mb-5">
                 <div class="card-header bg-primary text-white text-end" style="direction: rtl;">
-                    <h6 class="mb-0 fw-bold" data-i18n="what_if_title">💡 What If Smart Advisor</h6>
+                    <h6 class="mb-0 fw-bold">💡 What If Smart Advisor</h6>
                 </div>
                 <div class="card-body" style="direction: rtl; text-align: right;">
-                    <p class="text-muted small mb-3" data-i18n="what_if_desc">اختر لائحة ليحلل النظام ماذا تحتاج لتربح مقعداً إضافياً، وما تأثير زيادة الأصوات بنسبة معينة.</p>
+                    <p class="text-muted small mb-3">اختر لائحة ليحلل النظام ماذا تحتاج لتربح مقعداً إضافياً، وما تأثير زيادة الأصوات بنسبة معينة.</p>
                     <div class="row align-items-start">
                         <div class="col-md-4 mb-3 mb-md-0">
                             <select id="smartAdvisorList" class="form-select fw-bold border-primary text-primary shadow-sm mb-2">
-                                <option value="" disabled selected data-i18n="choose_list">-- اختر اللائحة --</option>
+                                <option value="" disabled selected>-- اختر اللائحة --</option>
                                 {% for group_name in groups.keys() %}
                                 <option value="{{ group_name }}">{{ group_name }}</option>
                                 {% endfor %}
                             </select>
-                            <button class="btn btn-primary w-100 fw-bold" onclick="runSmartAdvisor()" data-i18n="run_advisor">Run Advisor</button>
+                            <button class="btn btn-primary w-100 fw-bold" onclick="runSmartAdvisor()">Run Advisor</button>
                         </div>
                         <div class="col-md-8">
                             <div id="smartAdvisorResult" class="p-3 border rounded bg-light" style="display:none;"></div>
@@ -451,8 +457,8 @@
         <div class="modal-content border-0 shadow-lg">
             <div class="modal-header bg-warning">
                 <div>
-                    <!-- <h5 class="modal-title fw-bold mb-0" data-i18n="scenario_compare">Scenario Comparison</h5> -->
-                    <small class="text-dark" data-i18n="scenario_subtitle">Original database result vs current simulated result</small>
+                    <!-- <h5 class="modal-title fw-bold mb-0">Scenario Comparison</h5> -->
+                    <small class="text-dark">Original database result vs current simulated result</small>
                 </div>
                 <button type="button" class="btn-close" data-bs-dismiss="modal" aria-label="Close"></button>
             </div>
@@ -464,7 +470,6 @@
 </div>
 
 <script src="https://cdn.jsdelivr.net/npm/bootstrap@5.1.3/dist/js/bootstrap.bundle.min.js"></script>
-<script src="{{ url_for('static', filename='js/i18n.js') }}"></script>
 
 <script>
     const filename = "{{ file_id }}";
@@ -917,6 +922,24 @@
                 recalcResults();
             }
         } catch (e) { }
+    }
+
+    async function applySwapHint(outName, inName) {
+        try {
+            const res = await fetch('/api/swap_candidates', {
+                method: 'POST', headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ filename: filename, candidate_name: outName, target_name: inName })
+            });
+            const data = await res.json();
+            if (data.success) {
+                addLogMessage(`<strong>⇄ Swap Applied:</strong> <b>${data.src_name}</b> ↔ <b>${data.target_name}</b>.`, 'log-success');
+                window.location.reload();
+            } else {
+                addLogMessage(`<strong>❌ Error:</strong> ${data.message}`, 'log-error');
+            }
+        } catch (e) {
+            addLogMessage('<strong>❌ Error:</strong> Connection failed.', 'log-error');
+        }
     }
 
     // --- ADVANCED CHATBOT ---

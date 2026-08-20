@@ -22,13 +22,12 @@
     <div class="d-flex justify-content-between align-items-center flex-wrap gap-2 mb-4">
         <div>
             <h3 class="fw-bold mb-1">{{ region.district_label }} — 2018 vs 2022</h3>
-            <div class="text-muted" data-i18n="compare_desc">Compare list votes, seats, and winner changes.</div>
+            <div class="text-muted">Compare list votes, seats, and winner changes.</div>
         </div>
         <div class="d-flex gap-2">
-            <a href="/region/{{ slug }}?year=2018" class="btn btn-outline-primary fw-bold" data-i18n="open2018">Open 2018</a>
-            <a href="/region/{{ slug }}?year=2022" class="btn btn-primary fw-bold" data-i18n="open2022">Open 2022</a>
-            <button id="langToggleBtn" type="button" class="btn btn-outline-primary fw-bold" onclick="toggleLanguage()">العربية</button>
-            <a href="/?year=2022" class="btn btn-outline-dark" data-i18n="map">← Map</a>
+            <a href="/region/{{ slug }}?year=2018" class="btn btn-outline-primary fw-bold">Open 2018</a>
+            <a href="/region/{{ slug }}?year=2022" class="btn btn-primary fw-bold">Open 2022</a>
+            <a href="/?year=2022" class="btn btn-outline-dark">← Map</a>
         </div>
     </div>
 
@@ -40,10 +39,10 @@
                     <h5 class="fw-bold text-primary">{{ year }}</h5>
                     {% if years[year].available %}
                     <div class="row text-center g-3">
-                        <div class="col-6"><div class="metric">{{ "{:,}".format(years[year].total_votes) }}</div><div class="text-muted small"><span data-i18n="total_votes">Total votes</span></div></div>
-                        <div class="col-6"><div class="metric">{{ years[year].total_winners }}</div><div class="text-muted small"><span data-i18n="winners">Winners</span></div></div>
-                        <div class="col-6"><div class="metric">{{ years[year].total_lists }}</div><div class="text-muted small"><span data-i18n="lists">Lists</span></div></div>
-                        <div class="col-6"><div class="metric">{{ years[year].total_candidates }}</div><div class="text-muted small"><span data-i18n="candidates">Candidates</span></div></div>
+                        <div class="col-6"><div class="metric">{{ "{:,}".format(years[year].total_votes) }}</div><div class="text-muted small"><span>Total votes</span></div></div>
+                        <div class="col-6"><div class="metric">{{ years[year].total_winners }}</div><div class="text-muted small"><span>Winners</span></div></div>
+                        <div class="col-6"><div class="metric">{{ years[year].total_lists }}</div><div class="text-muted small"><span>Lists</span></div></div>
+                        <div class="col-6"><div class="metric">{{ years[year].total_candidates }}</div><div class="text-muted small"><span>Candidates</span></div></div>
                     </div>
                     {% if years[year].top_candidate %}
                     <hr>
@@ -65,7 +64,7 @@
     </div>
 
     <div class="card table-card mb-4">
-        <div class="card-header bg-white fw-bold" data-i18n="votes_by_list">Votes by list</div>
+        <div class="card-header bg-white fw-bold">Votes by list</div>
         <div class="card-body">
             <div id="compareChart" style="min-height:420px;"></div>
         </div>
@@ -73,8 +72,8 @@
 
     <div class="card table-card mb-4">
         <div class="card-header bg-white d-flex justify-content-between align-items-center">
-            <span class="fw-bold" data-i18n="list_comparison">List comparison table</span>
-            <input id="compareSearch" class="form-control form-control-sm" style="max-width:260px;" placeholder="Search list..." data-i18n-placeholder="search_list" oninput="filterCompareRows()">
+            <span class="fw-bold">List comparison table</span>
+            <input id="compareSearch" class="form-control form-control-sm" style="max-width:260px;" placeholder="Search list..." oninput="filterCompareRows()">
         </div>
         <div class="table-responsive">
             <table class="table table-hover align-middle mb-0" id="compareTable">
@@ -138,7 +137,6 @@
     </div>
 </div>
 
-<script src="{{ url_for('static', filename='js/i18n.js') }}"></script>
 <script>
     const compareChart = {{ chart_json | safe }};
     if (compareChart && compareChart.data) {

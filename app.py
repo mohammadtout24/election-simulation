@@ -1084,6 +1084,124 @@ def make_compare_payload(slug: str):
 
     return payload
 
+def build_national_payload(year: str):
+    """Aggregate seats/votes per list across every district for one year.
+
+    Winners are computed live by get_candidates_df(), so this reflects
+    whatever what-if edits are currently applied per district, not just
+    the original imported results.
+    """
+    seen_labels = set()
+    district_rows = []
+    list_totals = {}
+    winners_rows = []
+    total_seats = 0
+    total_votes = 0
+    districts_included = 0
+
+    all_regions = sorted(load_regions_from_database(), key=lambda r: (r["district_label"], r["name"]))
+    for region in all_regions:
+        label = region["district_label"]
+        if label == "Unknown" or "Beirut 3" in label or region["name"] == "Beirut-three":
+            continue
+        if label in seen_labels:
+            continue
+        seen_labels.add(label)
+
+        file_id = region["files"].get(year)
+        df = get_candidates_df(file_id) if file_id else None
+        if df is None or df.empty:
+            district_rows.append({"slug": region["slug"], "label": label, "available": False})
+            continue
+
+        districts_included += 1
+        district_seats = int(df["IS_WINNER"].sum())
+        district_votes = int(df["VOTES"].sum())
+        total_seats += district_seats
+        total_votes += district_votes
+
+        group_agg = df.groupby("GROUP", as_index=False).agg(
+            VOTES=("VOTES", "sum"), SEATS=("IS_WINNER", "sum"), CANDIDATES=("MEMBER", "count")
+        )
+
+        top_list = None
+        winning_rows = group_agg[group_agg["SEATS"] > 0].sort_values(["SEATS", "VOTES"], ascending=False)
+        if not winning_rows.empty:
+            r = winning_rows.iloc[0]
+            top_list = {"name": str(r["GROUP"]), "seats": int(r["SEATS"])}
+
+        district_rows.append({
+            "slug": region["slug"], "label": label, "available": True,
+            "seats": district_seats, "votes": district_votes, "top_list": top_list,
+        })
+
+        winner_df = df[df["IS_WINNER"] == True].sort_values("VOTES", ascending=False)
+        for _, r in winner_df.iterrows():
+            winners_rows.append({
+                "name": str(r["MEMBER"]),
+                "group": str(r["GROUP"]),
+                "votes": int(r["VOTES"]),
+                "religion": str(r["RELIGION"]),
+                "qada": str(r["DISTRICT"]),
+                "region_label": label,
+                "region_slug": region["slug"],
+            })
+
+        for _, row in group_agg.iterrows():
+            name = str(row["GROUP"])
+            entry = list_totals.setdefault(name, {"votes": 0, "seats": 0, "candidates": 0, "districts": set()})
+            entry["votes"] += int(row["VOTES"])
+            entry["seats"] += int(row["SEATS"])
+            entry["candidates"] += int(row["CANDIDATES"])
+            entry["districts"].add(label)
+
+    list_rows = []
+    for name, data in list_totals.items():
+        list_rows.append({
+            "name": name,
+            "votes": data["votes"],
+            "seats": data["seats"],
+            "candidates": data["candidates"],
+            "district_count": len(data["districts"]),
+            "vote_share": round((data["votes"] / total_votes) * 100, 2) if total_votes else 0.0,
+        })
+    list_rows.sort(key=lambda r: (r["seats"], r["votes"]), reverse=True)
+    winners_rows.sort(key=lambda r: (r["region_label"], -r["votes"]))
+
+    chart_json = "{}"
+    seat_winners = [r for r in list_rows if r["seats"] > 0][:20]
+    if seat_winners:
+        ordered = list(reversed(seat_winners))
+        fig = go.Figure(go.Bar(
+            x=[r["seats"] for r in ordered],
+            y=[r["name"] for r in ordered],
+            orientation="h",
+            text=[r["seats"] for r in ordered],
+            textposition="outside",
+            marker_color="#0d6efd",
+            cliponaxis=False,
+        ))
+        fig.update_layout(
+            height=max(320, len(ordered) * 32 + 60),
+            margin=dict(l=10, r=40, t=10, b=10),
+            plot_bgcolor="rgba(0,0,0,0)", paper_bgcolor="rgba(0,0,0,0)",
+            xaxis=dict(showgrid=False, zeroline=False, showticklabels=False),
+            yaxis=dict(automargin=True, tickfont=dict(size=11, color="#212529")),
+        )
+        chart_json = json.dumps(fig, cls=plotly.utils.PlotlyJSONEncoder)
+
+    return {
+        "year": year,
+        "district_rows": district_rows,
+        "list_rows": list_rows,
+        "winners_rows": winners_rows,
+        "total_seats": total_seats,
+        "total_votes": total_votes,
+        "districts_included": districts_included,
+        "districts_total": len(district_rows),
+        "chart_json": chart_json,
+    }
+
 # =========================================================
 #  ROUTES
 # =========================================================
@@ -1151,6 +1269,14 @@ def region_detail(slug):
     for grp in grouped: grouped[grp].sort(key=lambda x: x["votes"], reverse=True)
     grouped = dict(sorted(grouped.items(), key=lambda i: sum(x["votes"] for x in i[1]), reverse=True))
 
+    # Best available swap-in for each losing candidate, reusing the same
+    # engine that powers the What-If suggestion chat commands.
+    swap_hints = {}
+    for group_name in grouped.keys():
+        for s in build_atomic_swaps_for_group(df_agg, group_name):
+            if s["out"] not in swap_hints:
+                swap_hints[s["out"]] = s
+
     charts_by_district = {}
     districts = df_agg["DISTRICT"].unique() if len(df_agg["DISTRICT"].unique()) > 0 else ["General"]
     chart_global_counter = 0
@@ -1196,7 +1322,7 @@ def region_detail(slug):
         "detail.html", region_name=info["name"], sub_region_name=info["district_label"],
         groups=grouped, file_id=file_id, current_year=selected_year,
         charts_by_district=charts_by_district, total_seats=total_seats,
-        region_slug=slug, all_candidates=all_candidates_sorted
+        region_slug=slug, all_candidates=all_candidates_sorted, swap_hints=swap_hints
     )
 
 @app.route("/compare/<slug>")
@@ -1205,6 +1331,14 @@ def compare_years(slug):
     if payload is None:
         return abort(404)
     return render_template("compare.html", **payload)
+
+@app.route("/national")
+def national_dashboard():
+    selected_year = request.args.get("year", "2022")
+    if selected_year not in {"2018", "2022"}:
+        selected_year = "2022"
+    payload = build_national_payload(selected_year)
+    return render_template("national.html", current_year=selected_year, **payload)
 
 @app.route("/api/export_report/<file_id>/<fmt>")
 def export_report(file_id, fmt):
