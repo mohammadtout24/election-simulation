@@ -135,7 +135,7 @@ def load_tables_from_database(year: str, district_code: str):
 
             members_df = pd.read_sql(text("""
                 SELECT
-                    candidate_id AS "CANDIDATE_ID",
+                    CAST(candidate_id AS TEXT) AS "CANDIDATE_ID",
                     member AS "MEMBER",
                     group_name AS "GROUP",
                     religion AS "RELIGION",
@@ -147,7 +147,7 @@ def load_tables_from_database(year: str, district_code: str):
 
             data_df = pd.read_sql(text("""
                 SELECT
-                    candidate_id AS "CANDIDATE_ID",
+                    CAST(candidate_id AS TEXT) AS "CANDIDATE_ID",
                     member AS "MEMBER",
                     SUM(votes)::int AS "VOTES"
                 FROM election_votes
@@ -385,19 +385,52 @@ def get_candidates_df(file_id: str):
         def _has_real_ids(frame, col="CANDIDATE_ID"):
             if col not in frame.columns:
                 return False
-            ids = frame[col].astype(str).str.strip().str.lower()
-            ids = ids[~ids.isin(["", "none", "nan", "null", "nat"])]
-            return len(ids) > 0
+
+            ids = frame[col].dropna().astype("string").str.strip().str.lower()
+            ids = ids[~ids.isin(["", "none", "nan", "null", "nat", "<na>"])]
+            return not ids.empty
+
+        def _normalize_candidate_ids(frame, col="CANDIDATE_ID"):
+            """Normalize candidate IDs so Pandas always merges identical dtypes.
+
+            PostgreSQL/driver or Pandas version changes may return the same ID
+            column as text in one DataFrame and float in another. Converting both
+            sides to Pandas' nullable string dtype avoids object/float64 merge errors.
+            """
+            if col not in frame.columns:
+                return
+
+            ids = (
+                frame[col]
+                .astype("string")
+                .str.strip()
+                .str.replace(r"\.0$", "", regex=True)
+            )
+
+            invalid_ids = ids.str.lower().isin(
+                ["", "none", "nan", "null", "nat", "<na>"]
+            )
+            frame[col] = ids.mask(invalid_ids, pd.NA)
+
+        _normalize_candidate_ids(members_df)
+        _normalize_candidate_ids(data_df)
 
         use_candidate_id = _has_real_ids(members_df) and _has_real_ids(data_df)
 
         if use_candidate_id:
-            votes_agg = data_df.groupby("CANDIDATE_ID", as_index=False, dropna=False)["VOTES"].sum()
+            votes_agg = (
+                data_df.groupby(
+                    "CANDIDATE_ID",
+                    as_index=False,
+                    dropna=False,
+                )["VOTES"]
+                .sum()
+            )
             merged = pd.merge(
                 members_df,
                 votes_agg[["CANDIDATE_ID", "VOTES"]],
                 on="CANDIDATE_ID",
-                how="left"
+                how="left",
             )
         else:
             if "MEMBER" not in data_df.columns:
