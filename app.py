@@ -14,6 +14,7 @@ import plotly
 import plotly.graph_objects as go
 import plotly.utils
 from itertools import combinations
+from arabic_utils import normalize_arabic
 
 app = Flask(__name__)
 
@@ -147,8 +148,8 @@ def _quota_from_seats(seats_df: pd.DataFrame) -> dict:
     })
     if "DISTRICT" in normalized.columns and "RELIGION" in normalized.columns:
         for _, row in normalized.iterrows():
-            district = str(row.get("DISTRICT", "")).strip()
-            religion = str(row.get("RELIGION", "")).strip()
+            district = normalize_arabic(row.get("DISTRICT", ""))
+            religion = normalize_arabic(row.get("RELIGION", ""))
             if not district or not religion:
                 continue
             rel_limits[(district, religion)] = rel_limits.get((district, religion), 0) + 1
@@ -239,6 +240,26 @@ def get_region_from_database(slug: str):
         if region["slug"] == slug:
             return region
     return None
+
+
+def deduplicated_display_regions(regions):
+    """Filter out placeholder/ghost districts and collapse duplicate slugs
+    that share a district_label, in stable display_label order.
+
+    Shared by the map (index) and the national dashboard so a future change
+    to the exclusion rules (e.g. another phantom district needs hiding) only
+    has to be made in one place.
+    """
+    seen_labels, result = set(), []
+    for region in sorted(regions, key=lambda item: (item["district_label"], item["name"])):
+        label = region["district_label"]
+        if label == "Unknown" or "Beirut 3" in label or region["name"] == "Beirut-three":
+            continue
+        if label in seen_labels:
+            continue
+        seen_labels.add(label)
+        result.append(region)
+    return result
 
 
 def create_interactive_map(regions, selected_year):
@@ -337,100 +358,119 @@ def create_interactive_map(regions, selected_year):
 
 
 def persist_winner_flags(file_id: str, winners: set):
+    # winners holds candidate_id values (falls back to a name string only if
+    # a row somehow has no candidate_id) -- never match winners by name here:
+    # two candidates can share the exact same name, and a name-based UPDATE
+    # would flag both of them as winners even when only one of them won.
     year, district_code = parse_file_id(file_id)
     if year is None:
         return
-    winner_names = sorted({str(name) for name in winners})
+    winner_ids = sorted({str(w) for w in winners})
     with DB_ENGINE.begin() as conn:
         conn.execute(text("""
             UPDATE election_members
             SET is_winner = FALSE, updated_at = NOW()
             WHERE year = :year AND district_code = :district_code
         """), {"year": year, "district_code": district_code})
-        if winner_names:
+        if winner_ids:
             stmt = text("""
                 UPDATE election_members
                 SET is_winner = TRUE, updated_at = NOW()
                 WHERE year = :year AND district_code = :district_code
-                  AND member IN :winner_names
-            """).bindparams(bindparam("winner_names", expanding=True))
+                  AND COALESCE(candidate_id, member) IN :winner_ids
+            """).bindparams(bindparam("winner_ids", expanding=True))
             conn.execute(stmt, {
                 "year": year,
                 "district_code": district_code,
-                "winner_names": winner_names,
+                "winner_ids": winner_ids,
             })
 
 
-def update_candidate_group_db(file_id: str, candidate_name: str, new_group: str):
+def update_candidate_group_db(file_id: str, candidate_name: str, new_group: str, candidate_id: str = None):
+    # Two candidates can share the exact same name (confirmed in this
+    # dataset), so the UPDATE always targets the specific candidate_id
+    # resolved by the SELECT below -- never re-matches by name -- so it can
+    # only ever touch the one row that was actually read, even when the
+    # caller (e.g. the chat text interface) has no id to disambiguate with
+    # up front and multiple candidates share that name.
     year, district_code = parse_file_id(file_id)
     if year is None or not candidate_name or not str(new_group).strip():
         raise ValueError("Invalid election, candidate, or list.")
     with DB_ENGINE.begin() as conn:
         row = conn.execute(text("""
-            SELECT group_name
+            SELECT candidate_id, group_name
             FROM election_members
-            WHERE year = :year AND district_code = :district_code AND member = :member
+            WHERE year = :year AND district_code = :district_code
+              AND (candidate_id = :candidate_id OR (:candidate_id IS NULL AND member = :member))
             ORDER BY id
             LIMIT 1
             FOR UPDATE
-        """), {"year": year, "district_code": district_code, "member": candidate_name}).mappings().first()
+        """), {
+            "year": year, "district_code": district_code,
+            "member": candidate_name, "candidate_id": candidate_id,
+        }).mappings().first()
         if row is None:
             raise LookupError(f"Candidate {candidate_name} not found.")
         old_group = str(row["group_name"])
         conn.execute(text("""
             UPDATE election_members
             SET group_name = :new_group, updated_at = NOW()
-            WHERE year = :year AND district_code = :district_code AND member = :member
+            WHERE year = :year AND district_code = :district_code AND candidate_id = :resolved_id
         """), {
             "new_group": str(new_group).strip(), "year": year,
-            "district_code": district_code, "member": candidate_name,
+            "district_code": district_code, "resolved_id": row["candidate_id"],
         })
     return old_group
 
 
-def swap_candidate_groups_db(file_id: str, source_name: str, target_name: str):
+def swap_candidate_groups_db(
+    file_id: str, source_name: str, target_name: str,
+    source_id: str = None, target_id: str = None,
+):
+    # Same principle as update_candidate_group_db: each UPDATE below targets
+    # the specific candidate_id resolved by its own SELECT, never a name --
+    # so two same-named candidates (confirmed to exist in this dataset) can
+    # never both be mutated by one swap, with or without an explicit id.
     year, district_code = parse_file_id(file_id)
     if year is None or not source_name or not target_name or source_name == target_name:
         raise ValueError("Choose two different candidates.")
 
-    stmt = text("""
-        SELECT member, group_name, religion, district
+    row_sql = text("""
+        SELECT candidate_id, member, group_name, religion, district
         FROM election_members
         WHERE year = :year AND district_code = :district_code
-          AND member IN :names
+          AND (candidate_id = :cid OR (:cid IS NULL AND member = :name))
         ORDER BY id
+        LIMIT 1
         FOR UPDATE
-    """).bindparams(bindparam("names", expanding=True))
+    """)
 
     with DB_ENGINE.begin() as conn:
-        rows = conn.execute(stmt, {
-            "year": year, "district_code": district_code,
-            "names": [source_name, target_name],
-        }).mappings().all()
-        by_name = {str(row["member"]): row for row in rows}
-        if source_name not in by_name or target_name not in by_name:
+        source = conn.execute(row_sql, {
+            "year": year, "district_code": district_code, "name": source_name, "cid": source_id,
+        }).mappings().first()
+        target = conn.execute(row_sql, {
+            "year": year, "district_code": district_code, "name": target_name, "cid": target_id,
+        }).mappings().first()
+        if source is None or target is None:
             raise LookupError("One or both candidates were not found.")
-        source = by_name[source_name]
-        target = by_name[target_name]
         if str(source["religion"]) != str(target["religion"]) or str(source["district"]) != str(target["district"]):
             raise ValueError("Candidates must have the same religion and district.")
 
         source_group = str(source["group_name"])
         target_group = str(target["group_name"])
-        conn.execute(text("""
+        update_sql = text("""
             UPDATE election_members
-            SET group_name = CASE
-                WHEN member = :source_name THEN :target_group
-                WHEN member = :target_name THEN :source_group
-                ELSE group_name
-            END,
-            updated_at = NOW()
-            WHERE year = :year AND district_code = :district_code
-              AND member IN (:source_name, :target_name)
-        """), {
-            "source_name": source_name, "target_name": target_name,
-            "source_group": source_group, "target_group": target_group,
-            "year": year, "district_code": district_code,
+            SET group_name = :new_group, updated_at = NOW()
+            WHERE year = :year AND district_code = :district_code AND candidate_id = :resolved_id
+        """)
+        conn.execute(update_sql, {
+            "new_group": target_group, "year": year, "district_code": district_code,
+            "resolved_id": source["candidate_id"],
+        })
+        conn.execute(update_sql, {
+            "new_group": source_group, "year": year, "district_code": district_code,
+            "resolved_id": target["candidate_id"],
         })
     return {
         "source_group": source_group,
@@ -441,6 +481,13 @@ def swap_candidate_groups_db(file_id: str, source_name: str, target_name: str):
 
 
 def multi_swap_candidate_groups_db(file_id: str, swaps):
+    # NOTE: swap suggestions from build_atomic_swaps_for_group are name-only
+    # (no candidate_id), so this function -- unlike update_candidate_group_db
+    # and swap_candidate_groups_db -- still resolves candidates by name and
+    # is not safe against the same-name-different-list collisions documented
+    # there. Not hit by any of the 3 currently known duplicate pairs, but a
+    # real residual gap if a future district has one of its weakest/strongest
+    # candidates share a name with someone else in the same district.
     year, district_code = parse_file_id(file_id)
     if year is None or not swaps:
         raise ValueError("Invalid election identifier or empty swaps.")
@@ -571,18 +618,7 @@ def get_candidates_df(file_id: str, baseline: bool = False):
             columns={"REGION": "DISTRICT", "QADA": "DISTRICT", "SECT": "RELIGION", "CONFESSION": "RELIGION"}
         )
 
-        rel_limits = {}
-        dist_totals = {}
-        if "DISTRICT" in seats_df.columns and "RELIGION" in seats_df.columns:
-            for _, row in seats_df.iterrows():
-                d = str(row.get("DISTRICT", "")).strip()
-                r = str(row.get("RELIGION", "")).strip()
-                if not d or not r:
-                    continue
-                rel_limits[(d, r)] = rel_limits.get((d, r), 0) + 1
-                dist_totals[d] = dist_totals.get(d, 0) + 1
-
-        _store_request_quota(file_id, {"rel_limits": rel_limits, "dist_totals": dist_totals})
+        _store_request_quota(file_id, _quota_from_seats(seats_df))
 
         members_df = _std_cols(members_df)
         m_id = _pick(members_df, ["CANDIDATE_ID", "CANDIDATEID", "ID", "CID"])
@@ -699,10 +735,17 @@ def get_candidates_df(file_id: str, baseline: bool = False):
             )
 
         merged["VOTES"] = pd.to_numeric(merged.get("VOTES", 0), errors="coerce").fillna(0).astype(int)
-        df_final = merged[["MEMBER", "GROUP", "RELIGION", "DISTRICT", "VOTES"]].copy()
+        if "CANDIDATE_ID" not in merged.columns:
+            merged["CANDIDATE_ID"] = pd.NA
+        df_final = merged[["CANDIDATE_ID", "MEMBER", "GROUP", "RELIGION", "DISTRICT", "VOTES"]].copy()
 
+        # Two different candidates can legitimately share the exact same
+        # name (confirmed in this dataset -- e.g. Mount4/2018), so winner
+        # identity must be tracked by candidate_id, never by name: matching
+        # by name here would mark every same-named row as a winner the
+        # moment any one of them wins a seat.
         winners = _compute_winners_from_quota(file_id, df_final)
-        df_final["IS_WINNER"] = df_final["MEMBER"].astype(str).isin(winners)
+        df_final["IS_WINNER"] = df_final["CANDIDATE_ID"].isin(winners)
 
         return df_final
 
@@ -770,17 +813,25 @@ def _compute_winners_from_quota(file_id: str, df: pd.DataFrame) -> set:
     group_seats_filled = {g: 0 for g in group_seats_won}
 
     for _, row in df_final_members.iterrows():
-        c_name, c_dist, c_rel, c_group = row["MEMBER"], row["DISTRICT"], row["RELIGION"], row["GROUP"]
+        c_id, c_name, c_dist, c_rel, c_group = row["CANDIDATE_ID"], row["MEMBER"], row["DISTRICT"], row["RELIGION"], row["GROUP"]
         won, filled = group_seats_won.get(c_group, 0), group_seats_filled.get(c_group, 0)
-        
+
         if won - filled > 0:
-            mask = (df_seats["HOLDER"] == "NA") & (df_seats["DISTRICT"] == c_dist) & (df_seats["RELIGION"] == c_rel)
+            mask = (
+                (df_seats["HOLDER"] == "NA")
+                & (df_seats["DISTRICT"] == normalize_arabic(c_dist))
+                & (df_seats["RELIGION"] == normalize_arabic(c_rel))
+            )
             if mask.any():
                 seat_idx = df_seats[mask].index[0]
                 df_seats.loc[seat_idx, "HOLDER"] = c_name
                 df_seats.loc[seat_idx, "GROUP"] = c_group
                 group_seats_filled[c_group] += 1
-                winners.add(str(c_name))
+                # Two candidates can share the exact same name (confirmed in
+                # this dataset), so identity must be the candidate_id, never
+                # the name -- otherwise both same-named rows would end up
+                # flagged as winners even though only one of them won a seat.
+                winners.add(c_id if pd.notna(c_id) else str(c_name))
 
     return winners
 
@@ -824,7 +875,7 @@ def summarize_groups_for_compare(original_df: pd.DataFrame, current_df: pd.DataF
 #  FAST ON-DEMAND SUGGESTION ENGINE
 # =========================================================
 def count_group_winners(df: pd.DataFrame, winners: set) -> dict:
-    winner_df = df[df["MEMBER"].astype(str).isin(winners)].copy()
+    winner_df = df[df["CANDIDATE_ID"].isin(winners)].copy()
     if winner_df.empty: return {}
     return {str(k): int(v) for k, v in winner_df.groupby("GROUP")["MEMBER"].count().to_dict().items()}
 
@@ -848,12 +899,44 @@ def build_atomic_swaps_for_group(df: pd.DataFrame, target_group: str):
                     })
 
     atomic = sorted(atomic, key=lambda x: x["net_gain"], reverse=True)      #sort by net gain descending
-    seen, uniq = set(), []              
-    for a in atomic:                
+    seen, uniq = set(), []
+    for a in atomic:
         if (a["out"], a["in"]) not in seen:
-            seen.add((a["out"], a["in"]))   
+            seen.add((a["out"], a["in"]))
             uniq.append(a)                  #only keep unique swaps (no duplicates)
     return uniq[:12]
+
+def best_swap_for_candidate(df: pd.DataFrame, candidate_row) -> dict:
+    """Single best swap-in for one specific candidate, considering every
+    other candidate in the district -- not capped like
+    build_atomic_swaps_for_group(), which only samples each list's 8
+    weakest candidates against the top 25 outside candidates and then
+    truncates to the 12 best pairs overall. That cap is fine for the
+    combinatorial "how do I gain a whole seat" search, but it means a
+    losing candidate's own best swap can be silently missing from the list
+    (crowded out by other pairs) even though a real one exists -- this
+    checks that one candidate directly so every losing candidate gets an
+    accurate hint.
+    """
+    same_rel = str(candidate_row["RELIGION"])
+    same_dist = str(candidate_row["DISTRICT"])
+    own_votes = int(candidate_row["VOTES"])
+
+    pool = df[
+        (df["GROUP"] != candidate_row["GROUP"])
+        & (df["RELIGION"].astype(str) == same_rel)
+        & (df["DISTRICT"].astype(str) == same_dist)
+        & (df["VOTES"] > own_votes)
+    ].sort_values("VOTES", ascending=False)
+
+    if pool.empty:
+        return None
+    best = pool.iloc[0]
+    return {
+        "out": str(candidate_row["MEMBER"]), "out_id": candidate_row.get("CANDIDATE_ID"),
+        "in": str(best["MEMBER"]), "in_id": best.get("CANDIDATE_ID"),
+        "from_list": str(best["GROUP"]), "net_gain": int(best["VOTES"]) - own_votes,
+    }
 
 def is_valid_combo(combo):
     used_out, used_in = set(), set()
@@ -1091,7 +1174,6 @@ def build_national_payload(year: str):
     whatever what-if edits are currently applied per district, not just
     the original imported results.
     """
-    seen_labels = set()
     district_rows = []
     list_totals = {}
     winners_rows = []
@@ -1099,15 +1181,8 @@ def build_national_payload(year: str):
     total_votes = 0
     districts_included = 0
 
-    all_regions = sorted(load_regions_from_database(), key=lambda r: (r["district_label"], r["name"]))
-    for region in all_regions:
+    for region in deduplicated_display_regions(load_regions_from_database()):
         label = region["district_label"]
-        if label == "Unknown" or "Beirut 3" in label or region["name"] == "Beirut-three":
-            continue
-        if label in seen_labels:
-            continue
-        seen_labels.add(label)
-
         file_id = region["files"].get(year)
         df = get_candidates_df(file_id) if file_id else None
         if df is None or df.empty:
@@ -1214,8 +1289,10 @@ def index():
     all_regions = load_regions_from_database()
     if not all_regions:
         return (
-            "Map data is missing from PostgreSQL. Run schema_postgres.sql and "
-            "the one-time migrations/import_map_to_postgres.py script.",
+            "Map data is missing from PostgreSQL. Run migrations/import_from_excel.py "
+            "to populate election_seats/election_members/election_votes from the "
+            "source Excel files (election_regions -- the map geometry table -- must "
+            "already be seeded separately).",
             500,
         )
 
@@ -1228,14 +1305,10 @@ def index():
         if selected_year in region["files"]
     ]
 
-    unique_districts, seen_labels = [], set()
-    for region in sorted(available_regions, key=lambda item: (item["district_label"], item["name"])):
-        label = region["district_label"]
-        if label == "Unknown" or "Beirut 3" in label or region["name"] == "Beirut-three":
-            continue
-        if label not in seen_labels:
-            seen_labels.add(label)
-            unique_districts.append({**region, "active_year": selected_year})
+    unique_districts = [
+        {**region, "active_year": selected_year}
+        for region in deduplicated_display_regions(available_regions)
+    ]
 
     return render_template(
         "index.html",
@@ -1260,22 +1333,27 @@ def region_detail(slug):
 
     total_seats = sum(get_quota(file_id).get("rel_limits", {}).values())
 
-    df_agg = df.groupby("MEMBER", as_index=False).agg({"GROUP": "first", "RELIGION": "first", "DISTRICT": "first", "IS_WINNER": "max", "VOTES": "sum"})
-    
-    candidates = [{"name": str(r["MEMBER"]), "group": str(r["GROUP"]), "votes": int(r["VOTES"]), "religion": str(r["RELIGION"]), "district": str(r["DISTRICT"]), "is_winner": bool(r["IS_WINNER"])} for _, r in df_agg.iterrows()]
+    # Group by candidate_id, not member name: two candidates can share the
+    # exact same name (confirmed in this dataset), and grouping by name
+    # would silently merge them into a single card, hiding one entirely.
+    df_agg = df.groupby("CANDIDATE_ID", as_index=False).agg({"MEMBER": "first", "GROUP": "first", "RELIGION": "first", "DISTRICT": "first", "IS_WINNER": "max", "VOTES": "sum"})
+
+    candidates = [{"id": str(r["CANDIDATE_ID"]), "name": str(r["MEMBER"]), "group": str(r["GROUP"]), "votes": int(r["VOTES"]), "religion": str(r["RELIGION"]), "district": str(r["DISTRICT"]), "is_winner": bool(r["IS_WINNER"])} for _, r in df_agg.iterrows()]
 
     grouped = {}
     for c in candidates: grouped.setdefault(c["group"], []).append(c)
     for grp in grouped: grouped[grp].sort(key=lambda x: x["votes"], reverse=True)
     grouped = dict(sorted(grouped.items(), key=lambda i: sum(x["votes"] for x in i[1]), reverse=True))
 
-    # Best available swap-in for each losing candidate, reusing the same
-    # engine that powers the What-If suggestion chat commands.
+    # Best available swap-in for each losing candidate, computed individually
+    # (see best_swap_for_candidate) so every losing candidate gets an
+    # accurate hint instead of only whichever pairs survive the combinatorial
+    # suggestion engine's top-12-per-list cap.
     swap_hints = {}
-    for group_name in grouped.keys():
-        for s in build_atomic_swaps_for_group(df_agg, group_name):
-            if s["out"] not in swap_hints:
-                swap_hints[s["out"]] = s
+    for _, row in df_agg[df_agg["IS_WINNER"] != True].iterrows():
+        hint = best_swap_for_candidate(df_agg, row)
+        if hint:
+            swap_hints[str(row["CANDIDATE_ID"])] = hint
 
     charts_by_district = {}
     districts = df_agg["DISTRICT"].unique() if len(df_agg["DISTRICT"].unique()) > 0 else ["General"]
@@ -1605,7 +1683,7 @@ def api_scenario_comparison():
     # Make sure current winners reflect the latest state.
     current_winners = _compute_winners_from_quota(file_id, current_df)
     current_df = current_df.copy()
-    current_df["IS_WINNER"] = current_df["MEMBER"].astype(str).isin(current_winners)
+    current_df["IS_WINNER"] = current_df["CANDIDATE_ID"].isin(current_winners)
 
     original_winners = set(original_df[original_df["IS_WINNER"] == True]["MEMBER"].astype(str))
     current_winners = set(current_df[current_df["IS_WINNER"] == True]["MEMBER"].astype(str))
@@ -1665,7 +1743,7 @@ def api_what_if_advisor():
         swings.append({"percent": pct, "seats_after": after, "seat_gain": after - baseline})
 
     target_df = df[df["GROUP"] == target_group].copy().sort_values("VOTES", ascending=False)
-    non_winners_df = target_df[~target_df["MEMBER"].astype(str).isin(current_winners)]
+    non_winners_df = target_df[~target_df["CANDIDATE_ID"].isin(current_winners)]
 
     best_candidate = None
     if not non_winners_df.empty:
@@ -1673,7 +1751,7 @@ def api_what_if_advisor():
         best_candidate = {"name": str(r["MEMBER"]), "votes": int(r["VOTES"]), "religion": str(r["RELIGION"]), "district": str(r["DISTRICT"])}
 
     weakest_winner = None
-    other_winners = df[(df["MEMBER"].astype(str).isin(current_winners)) & (df["GROUP"] != target_group)].copy().sort_values("VOTES", ascending=True)
+    other_winners = df[(df["CANDIDATE_ID"].isin(current_winners)) & (df["GROUP"] != target_group)].copy().sort_values("VOTES", ascending=True)
     if not other_winners.empty:
         r = other_winners.iloc[0]
         weakest_winner = {"name": str(r["MEMBER"]), "group": str(r["GROUP"]), "votes": int(r["VOTES"]), "religion": str(r["RELIGION"]), "district": str(r["DISTRICT"])}
@@ -1709,8 +1787,9 @@ def change_candidate_group():
     file_id = data.get("filename")
     candidate_name = data.get("candidate_name")
     new_group = data.get("new_group")
+    candidate_id = data.get("candidate_id")
     try:
-        old_group = update_candidate_group_db(file_id, candidate_name, new_group)
+        old_group = update_candidate_group_db(file_id, candidate_name, new_group, candidate_id)
         recompute_winners(file_id)
         df = get_candidates_df(file_id)
         return jsonify({
@@ -1734,8 +1813,10 @@ def swap_candidates():
     file_id = data.get("filename")
     source_name = data.get("candidate_name")
     target_name = data.get("target_name")
+    source_id = data.get("candidate_id")
+    target_id = data.get("target_id")
     try:
-        swap = swap_candidate_groups_db(file_id, source_name, target_name)
+        swap = swap_candidate_groups_db(file_id, source_name, target_name, source_id, target_id)
         recompute_winners(file_id)
         df = get_candidates_df(file_id)
         source_group = swap["source_group"]
@@ -1854,7 +1935,7 @@ def api_find_winning_list():
 
         # Recompute winners with simulated data
         sim_winners = _compute_winners_from_quota(fid, sim_df)
-        would_win = candidate_name in sim_winners
+        would_win = candidate_row["CANDIDATE_ID"] in sim_winners
 
         results.append({
             "group": target_group,

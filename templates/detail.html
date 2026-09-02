@@ -287,7 +287,7 @@
                         </div>
                         <div class="sortable-list" id="list-{{ safe_id }}" data-group="{{ group_name }}">
                             {% for c in candidates %}
-                            <div class="candidate-card {{ 'winner-card' if c.is_winner else 'loser-card' }}" onclick="openCandidateProfile(this)" data-name="{{ c.name }}" data-votes="{{ c.votes }}" data-religion="{{ c.religion }}" data-district="{{ c.district }}" data-group="{{ group_name }}" data-winner="{{ 'true' if c.is_winner else 'false' }}">
+                            <div class="candidate-card {{ 'winner-card' if c.is_winner else 'loser-card' }}" onclick="openCandidateProfile(this)" data-name="{{ c.name }}" data-candidate-id="{{ c.id }}" data-votes="{{ c.votes }}" data-religion="{{ c.religion }}" data-district="{{ c.district }}" data-group="{{ group_name }}" data-winner="{{ 'true' if c.is_winner else 'false' }}">
                                 <div class="d-flex justify-content-between align-items-center">
                                     <div class="text-truncate d-flex align-items-start gap-2">
                                         <input type="checkbox" class="sel-checkbox mt-1"
@@ -302,8 +302,12 @@
                                     </div>
                                     <div class="text-end">
                                         <span class="fw-bold">{{ c.votes }}</span>
-                                        {% if not c.is_winner and c.name in swap_hints %}
-                                        <div class="swap-hint" title="Swap in {{ swap_hints[c.name]['in'] }} from {{ swap_hints[c.name]['from_list'] }} (+{{ swap_hints[c.name]['net_gain'] }} votes)" onclick="event.stopPropagation(); applySwapHint('{{ c.name }}', '{{ swap_hints[c.name]['in'] }}')">⇄ +{{ swap_hints[c.name]['net_gain'] }}</div>
+                                        {% if not c.is_winner and c.id in swap_hints %}
+                                        <div class="swap-hint"
+                                            data-swap-in-id="{{ swap_hints[c.id]['in_id'] }}"
+                                            data-swap-in-name="{{ swap_hints[c.id]['in'] }}"
+                                            title="Swap in {{ swap_hints[c.id]['in'] }} from {{ swap_hints[c.id]['from_list'] }} (+{{ swap_hints[c.id]['net_gain'] }} votes)"
+                                            onclick="event.stopPropagation(); applySwapHintFromEl(this)">⇄ +{{ swap_hints[c.id]['net_gain'] }}</div>
                                         {% endif %}
                                     </div>
                                 </div>
@@ -759,6 +763,7 @@
         if (evt.to === evt.from && evt.oldIndex === evt.newIndex) return;
 
         const candidateName = evt.item.dataset.name;
+        const candidateId = evt.item.dataset.candidateId;
         const newGroup = evt.to.dataset.group;
         const oldGroup = evt.from.dataset.group;
 
@@ -768,10 +773,14 @@
         if (swapItem && oldGroup !== newGroup) {
             // True swap: exchange candidates (must match religion + district)
             const targetName = swapItem.dataset.name;
+            const targetId = swapItem.dataset.candidateId;
             try {
                 const res = await fetch('/api/swap_candidates', {
                     method: 'POST', headers: {'Content-Type': 'application/json'},
-                    body: JSON.stringify({ filename: filename, candidate_name: candidateName, target_name: targetName })
+                    body: JSON.stringify({
+                        filename: filename, candidate_name: candidateName, target_name: targetName,
+                        candidate_id: candidateId || null, target_id: targetId || null,
+                    })
                 });
                 const data = await res.json();
 
@@ -801,7 +810,10 @@
             try {
                 const res = await fetch('/api/change_candidate_group', {
                     method: 'POST', headers: {'Content-Type': 'application/json'},
-                    body: JSON.stringify({ filename: filename, candidate_name: candidateName, new_group: newGroup })
+                    body: JSON.stringify({
+                        filename: filename, candidate_name: candidateName, new_group: newGroup,
+                        candidate_id: candidateId || null,
+                    })
                 });
                 const data = await res.json();
 
@@ -924,11 +936,19 @@
         } catch (e) { }
     }
 
-    async function applySwapHint(outName, inName) {
+    function applySwapHintFromEl(el) {
+        const card = el.closest('.candidate-card');
+        applySwapHint(card.dataset.name, el.dataset.swapInName, card.dataset.candidateId, el.dataset.swapInId);
+    }
+
+    async function applySwapHint(outName, inName, outId, inId) {
         try {
             const res = await fetch('/api/swap_candidates', {
                 method: 'POST', headers: { 'Content-Type': 'application/json' },
-                body: JSON.stringify({ filename: filename, candidate_name: outName, target_name: inName })
+                body: JSON.stringify({
+                    filename: filename, candidate_name: outName, target_name: inName,
+                    candidate_id: outId || null, target_id: inId || null,
+                })
             });
             const data = await res.json();
             if (data.success) {
