@@ -187,6 +187,60 @@ def get_quota(file_id: str) -> dict:
         return {"rel_limits": {}, "dist_totals": {}}
 
 
+def get_list_only_votes(file_id: str) -> dict:
+    """Votes cast for a list without naming a preferred candidate ("list
+    only" ballots under Lebanese preferential-vote law) -- real votes that
+    count toward a list's quota-seat total but were never attributed to any
+    individual candidate, so they never appear in a per-candidate VOTES sum.
+    """
+    request_cache = _request_dict("list_only_cache")
+    if request_cache is not None and file_id in request_cache:
+        return request_cache[file_id]
+
+    year, district_code = parse_file_id(file_id)
+    if year is None:
+        return {}
+    try:
+        with DB_ENGINE.connect() as conn:
+            rows = conn.execute(text("""
+                SELECT group_name, COALESCE(SUM(votes), 0)::int AS votes
+                FROM election_votes
+                WHERE year = :year AND district_code = :district_code
+                  AND candidate_id IS NULL AND group_name IS NOT NULL
+                GROUP BY group_name
+            """), {"year": year, "district_code": district_code}).all()
+        result = {str(g): int(v) for g, v in rows}
+    except Exception as exc:
+        print(f"List-only vote load failed for {file_id}: {exc}")
+        result = {}
+    if request_cache is not None:
+        request_cache[file_id] = result
+    return result
+
+
+def group_vote_totals(file_id: str, df: pd.DataFrame) -> pd.DataFrame:
+    """Per-list (GROUP) vote totals, including list-only ballots -- the
+    single source of truth every seat-quota calculation should sum from,
+    instead of a bare df.groupby("GROUP")["VOTES"].sum() which silently
+    excludes list-only ballots and therefore undercounts every list."""
+    df_group = df.groupby("GROUP", as_index=False)["VOTES"].sum()
+    list_only = get_list_only_votes(file_id)
+    if not list_only:
+        return df_group
+
+    df_group["VOTES"] = df_group.apply(
+        lambda row: row["VOTES"] + list_only.get(str(row["GROUP"]), 0), axis=1
+    )
+    # A list can have list-only ballots but zero individual candidates (or
+    # zero candidates who received any preferential votes), in which case it
+    # never appears in df_group at all; add it so its votes still count.
+    missing_groups = set(list_only) - set(df_group["GROUP"].astype(str))
+    if missing_groups:
+        extra = pd.DataFrame([{"GROUP": g, "VOTES": list_only[g]} for g in missing_groups])
+        df_group = pd.concat([df_group, extra], ignore_index=True)
+    return df_group
+
+
 def load_regions_from_database():
     """Load map geometry and year availability from PostgreSQL."""
     sql = text("""
@@ -766,7 +820,7 @@ def _compute_winners_from_quota(file_id: str, df: pd.DataFrame) -> set:
             seats_list.append({"DISTRICT": dist, "RELIGION": rel, "HOLDER": "NA", "GROUP": "NA"})
     df_seats = pd.DataFrame(seats_list)
 
-    df_group = df.groupby("GROUP", as_index=False)["VOTES"].sum()
+    df_group = group_vote_totals(file_id, df)
     valid_electoral = df_group["VOTES"].sum()
     if valid_electoral == 0: return set()
 
@@ -970,7 +1024,7 @@ def calculate_votes_needed_for_one_group(file_id, df, target_group, target_k):
     num_seats = sum(quota.get("rel_limits", {}).values())
     if num_seats == 0: return None
 
-    df_group = df.groupby("GROUP", as_index=False)["VOTES"].sum()
+    df_group = group_vote_totals(file_id, df)
     valid_electoral = df_group["VOTES"].sum()
     if valid_electoral == 0: return None            #check if there are any valid votes in the election data; if not, return None
 

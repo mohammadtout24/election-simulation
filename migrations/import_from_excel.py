@@ -12,6 +12,7 @@ district/year combos that already contain two different candidates who
 happen to share the exact same name.
 """
 import os
+import re
 import sys
 
 import pandas as pd
@@ -20,11 +21,36 @@ from sqlalchemy import create_engine, text
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from arabic_utils import normalize_arabic
 
+_LEADING_LIST_NUMBER = re.compile(r"^\(?\s*\d+\s*\)?\s*")
+
+
+def canon_group(value) -> str:
+    """Collapse a list name down to something comparable across sources:
+    strips a leading list-order number ("4 الأمل والوفاء" -> same list as
+    "الأمل والوفاء"), folds Arabic spelling variants, and ignores all
+    internal spacing. Two group strings that canonicalize the same are the
+    same list; if they don't, it's a genuine disagreement about which list a
+    candidate belongs to, not just formatting drift."""
+    text_value = _LEADING_LIST_NUMBER.sub("", str(value or ""))
+    return normalize_arabic(text_value).replace(" ", "")
+
 BASE_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 DATABASE_URL = os.environ.get(
     "DATABASE_URL",
     "postgresql+psycopg2://postgres:lims@localhost:5432/election_db",
 )
+
+
+# The 2022/south3 source folder is lowercase, but election_regions (the
+# routing table) uses "South3" -- using the folder name as-is for
+# district_code silently split this district's data into two disconnected
+# rows (one the app can never reach). Normalize explicitly so district_code
+# always matches election_regions' casing.
+DISTRICT_CODE_OVERRIDES = {"south3": "South3"}
+
+
+def normalize_district_code(folder_name: str) -> str:
+    return DISTRICT_CODE_OVERRIDES.get(folder_name, folder_name)
 
 
 def find_file(folder: str, district: str, suffix: str):
@@ -136,11 +162,44 @@ def load_district(year: str, district: str, folder: str):
         bad_votes = int(bad["VOTES"].sum())
         warning = f"{still_unmatched} real vote row(s) ({bad_votes} votes) unmatched, e.g. {bad_names}"
 
+    # A candidate can be listed under one group in the members roster but
+    # have their actual votes recorded under a different group in the raw
+    # ballot export -- confirmed in several districts (e.g. a South3/2022
+    # candidate registered under "صوت الجنوب" in the roster whose votes were
+    # all tallied under "معاً نحو التغيير"). The votes export reflects what
+    # was actually on the ballot, so when the two genuinely disagree (not
+    # just a formatting difference -- a leading list number, a hamza
+    # variant, extra spacing) trust the votes export and correct the
+    # candidate's stored group accordingly.
+    matched_votes = votes_merged[votes_merged["candidate_id"].notna()]
+    id_to_member_group = dict(zip(members_df["candidate_id"], members_df["GROUP"]))
+    corrections = {}
+    for _, row in matched_votes.iterrows():
+        cid = row["candidate_id"]
+        member_group = id_to_member_group.get(cid)
+        if member_group is None or canon_group(member_group) == canon_group(row["GROUP"]):
+            continue
+        # Guard against a different raw-data error: the votes export
+        # occasionally has a candidate's own name typed into the GROUP
+        # column instead of their real list (confirmed in South1/2022).
+        # Trusting that would orphan a real candidate into a phantom
+        # one-person "list", which can silently cost their real list a
+        # seat. A group that IS the candidate's own name is never a real
+        # list, so never "correct" to it -- keep the roster's value instead.
+        if canon_group(row["GROUP"]) == canon_group(row["MEMBER"]):
+            continue
+        corrections[cid] = row["GROUP"]
+    if corrections:
+        members_df["GROUP"] = members_df.apply(
+            lambda r: corrections.get(r["candidate_id"], r["GROUP"]), axis=1
+        )
+
     return {
         "seats": seats_df[["RELIGION", "REGION"]],
         "members": members_df,
         "votes": votes_merged,
         "warning": warning,
+        "group_corrections": corrections,
     }, None
 
 
@@ -150,10 +209,11 @@ def import_all(dry_run: bool = False):
 
     for year in ("2018", "2022"):
         year_dir = os.path.join(BASE_DIR, year)
-        for district in sorted(os.listdir(year_dir)):
-            folder = os.path.join(year_dir, district)
-            if not os.path.isdir(folder) or district.lower() == "results":
+        for raw_district in sorted(os.listdir(year_dir)):
+            folder = os.path.join(year_dir, raw_district)
+            if not os.path.isdir(folder) or raw_district.lower() == "results":
                 continue
+            district = normalize_district_code(raw_district)
 
             data, error = load_district(year, district, folder)
             if error:
@@ -162,6 +222,8 @@ def import_all(dry_run: bool = False):
 
             seats_df, members_df, votes_df = data["seats"], data["members"], data["votes"]
             detail_suffix = f" -- WARNING: {data['warning']}" if data["warning"] else ""
+            if data["group_corrections"]:
+                detail_suffix += f" -- {len(data['group_corrections'])} candidate(s) had their list corrected to match their recorded votes"
 
             if dry_run:
                 results.append((
@@ -215,14 +277,15 @@ def import_all(dry_run: bool = False):
 
                 conn.execute(
                     text("""
-                        INSERT INTO election_votes (year, district_code, candidate_id, member, votes)
-                        VALUES (:year, :d, :candidate_id, :member, :votes)
+                        INSERT INTO election_votes (year, district_code, candidate_id, member, group_name, votes)
+                        VALUES (:year, :d, :candidate_id, :member, :group_name, :votes)
                     """),
                     [
                         {
                             "year": int(year), "d": district,
                             "candidate_id": r["candidate_id"] if pd.notna(r["candidate_id"]) else None,
                             "member": r["MEMBER"],
+                            "group_name": r["GROUP"],
                             "votes": int(r["VOTES"]),
                         }
                         for _, r in votes_df.iterrows()
