@@ -4,8 +4,8 @@
     {
       "name": "election-map-flask",
       "runtimeExecutable": "python",
-      "runtimeArgs": ["-m", "flask", "run", "--port", "5000"],
-      "port": 5000
+      "runtimeArgs": ["-m", "flask", "run", "--port", "5051"],
+      "port": 5051
     }
   ]
 }
