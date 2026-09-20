@@ -99,7 +99,7 @@
                     {% for row in list_rows %}
                     <tr>
                         <td><span class="rank-badge">{{ loop.index }}</span></td>
-                        <td class="fw-bold">{{ row.name }}</td>
+                        <td class="fw-bold">{{ row.name | clean_list_name }}</td>
                         <td class="text-end fw-bold {{ 'text-primary' if row.seats > 0 else '' }}">{{ row.seats }}</td>
                         <td class="text-end">{{ "{:,}".format(row.votes) }}</td>
                         <td class="text-end">{{ row.vote_share }}%</td>
@@ -175,7 +175,7 @@
                         {% if row.available %}
                         <td class="text-end">{{ row.seats }}</td>
                         <td class="text-end">{{ "{:,}".format(row.votes) }}</td>
-                        <td>{{ row.top_list.name if row.top_list else "—" }}</td>
+                        <td>{{ row.top_list.name | clean_list_name if row.top_list else "—" }}</td>
                         {% else %}
                         <td class="text-end district-missing" colspan="3">No data for this year.</td>
                         {% endif %}

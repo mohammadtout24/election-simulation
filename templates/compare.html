@@ -15,6 +15,7 @@
         .delta-neg { color:#dc3545; font-weight:700; }
         .delta-zero { color:#6c757d; font-weight:700; }
         .winner-chip { display:inline-block; margin:3px; padding:5px 9px; border-radius:999px; background:#eef2ff; font-size:0.85rem; }
+        .rank-badge { display:inline-flex; align-items:center; justify-content:center; width:24px; height:24px; border-radius:50%; background:#eef2ff; color:#0d6efd; font-weight:700; font-size:0.75rem; }
     </style>
 </head>
 <body>
@@ -79,6 +80,7 @@
             <table class="table table-hover align-middle mb-0" id="compareTable">
                 <thead class="table-light">
                     <tr>
+                        <th>#</th>
                         <th>List</th>
                         <th class="text-end">Votes 2018</th>
                         <th class="text-end">Votes 2022</th>
@@ -91,7 +93,8 @@
                 <tbody>
                     {% for row in groups %}
                     <tr>
-                        <td class="fw-bold">{{ row.GROUP }}</td>
+                        <td><span class="rank-badge">{{ loop.index }}</span></td>
+                        <td class="fw-bold">{{ row.GROUP | clean_list_name }}</td>
                         <td class="text-end">{{ "{:,}".format(row.votes_2018) }}</td>
                         <td class="text-end">{{ "{:,}".format(row.votes_2022) }}</td>
                         <td class="text-end {% if row.vote_change > 0 %}delta-pos{% elif row.vote_change < 0 %}delta-neg{% else %}delta-zero{% endif %}">

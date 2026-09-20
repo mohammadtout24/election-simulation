@@ -1097,6 +1097,19 @@ def calculate_votes_needed_for_one_group(file_id, df, target_group, target_k):
 # =========================================================
 #  ADDED FEATURE HELPERS: EXPORT + COMPARISON
 # =========================================================
+_LIST_NUMBER_RE = re.compile(r"^\(\s*\d+\s*\)\s*|\s*\(\s*\d+\s*\)\s*$")
+
+def strip_list_number(name) -> str:
+    """Ballot list names in the source data carry their official list-order
+    number in parentheses (e.g. "طموح الشباب (3)", "( 4 ) إنقاذ وطن").
+    Strip it for display -- the UI shows each list's rank instead."""
+    text = str(name or "").strip()
+    cleaned = _LIST_NUMBER_RE.sub("", text).strip()
+    return cleaned or text
+
+app.jinja_env.filters["clean_list_name"] = strip_list_number
+
+
 def safe_sheet_name(name: str) -> str:
     cleaned = re.sub(r"[\\/*?:\[\]]", "_", str(name or "Sheet"))[:31]
     return cleaned or "Sheet"       #return a safe sheet name for Excel by replacing invalid characters and limiting the length to 31 characters
@@ -1201,9 +1214,10 @@ def make_compare_payload(slug: str):
         merged = merged.sort_values("votes_2022", ascending=False)
         payload["groups"] = merged.to_dict(orient="records")
 
+        chart_labels = [strip_list_number(g) for g in merged["GROUP"].tolist()]
         fig = go.Figure()
-        fig.add_bar(name="2018", x=merged["GROUP"].tolist(), y=merged["votes_2018"].tolist())
-        fig.add_bar(name="2022", x=merged["GROUP"].tolist(), y=merged["votes_2022"].tolist())
+        fig.add_bar(name="2018", x=chart_labels, y=merged["votes_2018"].tolist())
+        fig.add_bar(name="2022", x=chart_labels, y=merged["votes_2022"].tolist())
         fig.update_layout(
             barmode="group", height=420, margin=dict(l=30, r=20, t=30, b=110),
             plot_bgcolor="rgba(0,0,0,0)", paper_bgcolor="rgba(0,0,0,0)",
@@ -1303,7 +1317,7 @@ def build_national_payload(year: str):
         ordered = list(reversed(seat_winners))
         fig = go.Figure(go.Bar(
             x=[r["seats"] for r in ordered],
-            y=[r["name"] for r in ordered],
+            y=[strip_list_number(r["name"]) for r in ordered],
             orientation="h",
             text=[r["seats"] for r in ordered],
             textposition="outside",
@@ -1949,7 +1963,7 @@ def api_find_winning_list():
         if target_group == current_group:
             # Check current state
             results.append({
-                "group": target_group,
+                "group": strip_list_number(target_group),
                 "wins": is_currently_winner,
                 "is_current": True,
                 "possible": True,
@@ -1970,7 +1984,7 @@ def api_find_winning_list():
         # If no one matches the religion and district in the target list, a swap isn't possible
         if potential_swaps.empty:
             results.append({
-                "group": target_group,
+                "group": strip_list_number(target_group),
                 "wins": False,
                 "is_current": False,
                 "possible": False,
@@ -1992,7 +2006,7 @@ def api_find_winning_list():
         would_win = candidate_row["CANDIDATE_ID"] in sim_winners
 
         results.append({
-            "group": target_group,
+            "group": strip_list_number(target_group),
             "wins": would_win,
             "is_current": False,
             "possible": True,
@@ -2006,7 +2020,7 @@ def api_find_winning_list():
         "religion": candidate_religion,
         "district": candidate_district,
         "votes": candidate_votes,
-        "current_group": current_group,
+        "current_group": strip_list_number(current_group),
         "currently_winner": is_currently_winner,
         "results": results
     })
@@ -2093,7 +2107,7 @@ def api_chat():
         by_group = winners.groupby("GROUP")["MEMBER"].apply(list).to_dict()
         html = f"🏆 <b>الفائزون ({len(winners)} مقعد):</b><br><br>"
         for grp, names in sorted(by_group.items(), key=lambda x: len(x[1]), reverse=True):
-            html += f"<b style='color:#0d6efd;'>{grp}</b> ({len(names)}):<br>"
+            html += f"<b style='color:#0d6efd;'>{strip_list_number(grp)}</b> ({len(names)}):<br>"
             for n in names:
                 html += f"  ✅ {n}<br>"
             html += "<br>"
@@ -2130,13 +2144,13 @@ def api_chat():
             html += f"<div style='flex:1;background:#f8f9fc;padding:8px;border-radius:8px;border-right:3px solid #667eea;'>"
             html += f"<b>{name_a}</b> {status_a}<br>"
             html += f"<span style='color:#6c757d;font-size:0.75rem;'>{row_a['RELIGION']} • {row_a['DISTRICT']}</span><br>"
-            html += f"اللائحة: {row_a['GROUP']}<br>"
+            html += f"اللائحة: {strip_list_number(row_a['GROUP'])}<br>"
             html += f"الأصوات: <b>{votes_a:,}</b>"
             html += f"</div>"
             html += f"<div style='flex:1;background:#f8f9fc;padding:8px;border-radius:8px;border-right:3px solid #764ba2;'>"
             html += f"<b>{name_b}</b> {status_b}<br>"
             html += f"<span style='color:#6c757d;font-size:0.75rem;'>{row_b['RELIGION']} • {row_b['DISTRICT']}</span><br>"
-            html += f"اللائحة: {row_b['GROUP']}<br>"
+            html += f"اللائحة: {strip_list_number(row_b['GROUP'])}<br>"
             html += f"الأصوات: <b>{votes_b:,}</b>"
             html += f"</div></div>"
             html += f"<br><b>الفرق:</b> {diff:,} صوت لصالح <b>{leader}</b>"
@@ -2174,7 +2188,7 @@ def api_chat():
                 grp_total = int(df[df["GROUP"] == grp]["VOTES"].sum())
                 bar_width = int((cnt / max(1, num_seats)) * 100)
                 html += f"<div style='margin:3px 0;'>"
-                html += f"<div style='display:flex;justify-content:space-between;font-size:0.78rem;'><span>{grp}</span><span><b>{int(cnt)}</b> مقعد • {grp_total:,} صوت</span></div>"
+                html += f"<div style='display:flex;justify-content:space-between;font-size:0.78rem;'><span>{strip_list_number(grp)}</span><span><b>{int(cnt)}</b> مقعد • {grp_total:,} صوت</span></div>"
                 html += f"<div style='background:#e0e3e8;border-radius:4px;height:6px;margin-top:2px;'>"
                 html += f"<div style='background:linear-gradient(90deg,#667eea,#764ba2);width:{bar_width}%;height:100%;border-radius:4px;'></div>"
                 html += f"</div></div>"
@@ -2210,7 +2224,7 @@ def api_chat():
             html += f"<div style='background:#f8f9fc;padding:10px;border-radius:10px;border-right:3px solid {status_color};'>"
             html += f"<b style='font-size:0.9rem;'>{best_match}</b> <span style='color:{status_color};'>{status_icon} {status_text}</span><br>"
             html += f"<span style='color:#6c757d;font-size:0.75rem;'>{row['RELIGION']} • {row['DISTRICT']}</span><br><br>"
-            html += f"📋 اللائحة: <b>{row['GROUP']}</b><br>"
+            html += f"📋 اللائحة: <b>{strip_list_number(row['GROUP'])}</b><br>"
             html += f"🗳️ الأصوات: <b>{votes:,}</b> ({pct}% من لائحته)<br>"
             html += f"<div style='background:#e0e3e8;border-radius:4px;height:5px;margin-top:4px;'>"
             html += f"<div style='background:linear-gradient(90deg,#667eea,#764ba2);width:{min(100,pct)}%;height:100%;border-radius:4px;'></div>"
@@ -2229,7 +2243,7 @@ def api_chat():
                 eq = total / max(1, num_seats) if num_seats > 0 else 0
 
                 html = f"<div style='font-size:0.82rem;'>"
-                html += f"<b style='color:#667eea;'>📋 {grp}</b><br>"
+                html += f"<b style='color:#667eea;'>📋 {strip_list_number(grp)}</b><br>"
                 html += f"المجموع: <b>{total:,}</b> صوت | الفائزون: <b>{winners_count}</b><br>"
                 if num_seats > 0:
                     pct = round((total / max(1, df["VOTES"].sum())) * 100, 1)
@@ -2256,7 +2270,7 @@ def api_chat():
             icon = "🏆" if r["IS_WINNER"] else ""
             html += f"<div style='margin-bottom:4px;'>"
             html += f"<b>{rank}.</b> {r['MEMBER']} {icon} — <b>{votes:,}</b>"
-            html += f" <span style='color:#6c757d;font-size:0.7rem;'>({r['GROUP']})</span>"
+            html += f" <span style='color:#6c757d;font-size:0.7rem;'>({strip_list_number(r['GROUP'])})</span>"
             html += f"<div style='background:#e0e3e8;border-radius:3px;height:4px;margin-top:1px;'>"
             html += f"<div style='background:linear-gradient(90deg,#667eea,#764ba2);width:{bar_w}%;height:100%;border-radius:3px;'></div>"
             html += f"</div></div>"

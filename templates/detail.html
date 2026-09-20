@@ -44,6 +44,7 @@
         .swap-hint { cursor: pointer; margin-top: 3px; font-size: 0.65rem; font-weight: 700; color: #b8860b; background: #fff8e1; border: 1px solid #f0d264; border-radius: 4px; padding: 1px 5px; display: inline-block; white-space: nowrap; }
         .swap-hint:hover { background: #ffecb3; color: #7a5c00; }
         .list-header { background: #0d6efd; color: white; padding: 8px 12px; font-size: 0.9rem; font-weight: bold; border-radius: 6px 6px 0 0; }
+        .list-rank { background: rgba(255,255,255,0.25); border-radius: 999px; padding: 1px 8px; font-size: 0.75rem; flex-shrink: 0; }
         .sortable-list { height: 450px; overflow-y: auto; background: #fff; border: 1px solid #dee2e6; border-top: none; padding: 8px; border-radius: 0 0 6px 6px; min-height: 100px; }
 
         .add-btn { cursor: pointer; color: #0d6efd; font-weight: bold; border: 1px solid #0d6efd; border-radius: 4px; padding: 0 6px; transition: all 0.2s; }
@@ -282,7 +283,10 @@
                 <div class="col">
                     <div class="card border-0">
                         <div class="list-header d-flex justify-content-between align-items-center flex-wrap">
-                            <div class="text-truncate" style="max-width: 75%;">{{ group_name }}</div>
+                            <div class="text-truncate d-flex align-items-center gap-2" style="max-width: 75%;">
+                                <span class="list-rank">#{{ loop.index }}</span>
+                                <span class="text-truncate">{{ group_name | clean_list_name }}</span>
+                            </div>
                             <span class="badge bg-white text-primary" id="total-{{ safe_id }}">{{ total_votes }}</span>
                         </div>
                         <div class="sortable-list" id="list-{{ safe_id }}" data-group="{{ group_name }}">
@@ -306,7 +310,7 @@
                                         <div class="swap-hint"
                                             data-swap-in-id="{{ swap_hints[c.id]['in_id'] }}"
                                             data-swap-in-name="{{ swap_hints[c.id]['in'] }}"
-                                            title="Swap in {{ swap_hints[c.id]['in'] }} from {{ swap_hints[c.id]['from_list'] }} (+{{ swap_hints[c.id]['net_gain'] }} votes)"
+                                            title="Swap in {{ swap_hints[c.id]['in'] }} from {{ swap_hints[c.id]['from_list'] | clean_list_name }} (+{{ swap_hints[c.id]['net_gain'] }} votes)"
                                             onclick="event.stopPropagation(); applySwapHintFromEl(this)">⇄ +{{ swap_hints[c.id]['net_gain'] }}</div>
                                         {% endif %}
                                     </div>
