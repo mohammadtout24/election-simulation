@@ -41,8 +41,6 @@
         .candidate-card.winner-card { background-color: #e8f5e9; border-left: 4px solid #2e7d32; color: #1b5e20; }
         .candidate-card.loser-card { background-color: #ffffff; border-left: 4px solid #ced4da; }
         .badge-winner { background-color: #2e7d32; color: white; font-size: 0.6rem; padding: 1px 5px; border-radius: 3px; font-weight: bold; margin-top: 4px; display: inline-block; }
-        .swap-hint { cursor: pointer; margin-top: 3px; font-size: 0.65rem; font-weight: 700; color: #b8860b; background: #fff8e1; border: 1px solid #f0d264; border-radius: 4px; padding: 1px 5px; display: inline-block; white-space: nowrap; }
-        .swap-hint:hover { background: #ffecb3; color: #7a5c00; }
         .list-header { background: #0d6efd; color: white; padding: 8px 12px; font-size: 0.9rem; font-weight: bold; border-radius: 6px 6px 0 0; }
         .list-rank { background: rgba(255,255,255,0.25); border-radius: 999px; padding: 1px 8px; font-size: 0.75rem; flex-shrink: 0; }
         .sortable-list { height: 450px; overflow-y: auto; background: #fff; border: 1px solid #dee2e6; border-top: none; padding: 8px; border-radius: 0 0 6px 6px; min-height: 100px; }
@@ -305,14 +303,7 @@
                                         </div>
                                     </div>
                                     <div class="text-end">
-                                        <span class="fw-bold">{{ c.votes }}</span>
-                                        {% if not c.is_winner and c.id in swap_hints %}
-                                        <div class="swap-hint"
-                                            data-swap-in-id="{{ swap_hints[c.id]['in_id'] }}"
-                                            data-swap-in-name="{{ swap_hints[c.id]['in'] }}"
-                                            title="Swap in {{ swap_hints[c.id]['in'] }} from {{ swap_hints[c.id]['from_list'] | clean_list_name }} (+{{ swap_hints[c.id]['net_gain'] }} votes)"
-                                            onclick="event.stopPropagation(); applySwapHintFromEl(this)">⇄ +{{ swap_hints[c.id]['net_gain'] }}</div>
-                                        {% endif %}
+                                        <span class="fw-bold cand-pct" title="{{ '{:,}'.format(c.votes) }} votes">{{ '%.1f' % ((c.votes / total_votes * 100) if total_votes else 0) }}%</span>
                                     </div>
                                 </div>
                             </div>
@@ -763,6 +754,18 @@
     }
 
     // --- DRAG AND DROP / SWAP LOGIC ---
+    function refreshCandidatePercents() {
+        document.querySelectorAll('.sortable-list').forEach(list => {
+            const cards = [...list.querySelectorAll('.candidate-card')];
+            const total = cards.reduce((s, c) => s + (parseInt(c.dataset.votes) || 0), 0);
+            cards.forEach(c => {
+                const v = parseInt(c.dataset.votes) || 0;
+                const el = c.querySelector('.cand-pct');
+                if (el) el.textContent = (total ? (v / total * 100) : 0).toFixed(1) + '%';
+            });
+        });
+    }
+
     async function handleDrop(evt) {
         if (evt.to === evt.from && evt.oldIndex === evt.newIndex) return;
 
@@ -797,7 +800,7 @@
                     if (document.getElementById('total-' + data.target_group_id)) {
                         document.getElementById('total-' + data.target_group_id).innerText = data.target_total.toLocaleString();
                     }
-                    currentVotesNeeded = {};
+                    currentVotesNeeded = {}; refreshCandidatePercents();
                 } else {
                     // Revert the DOM swap: put each card back in its original list
                     evt.from.insertBefore(evt.item, evt.from.children[evt.oldIndex] || null);
@@ -831,7 +834,7 @@
                     if (document.getElementById('total-' + newSafeId)) {
                         document.getElementById('total-' + newSafeId).innerText = data.new_total.toLocaleString();
                     }
-                    currentVotesNeeded = {};
+                    currentVotesNeeded = {}; refreshCandidatePercents();
                 } else {
                     addLogMessage(`<strong>❌ خطأ:</strong> ${data.message}`, 'log-error');
                 }
@@ -889,14 +892,14 @@
         `;
 
         if (listData.suggestions && listData.suggestions.length > 0) {
-            html += `<hr class="my-2"><p class="small text-muted mb-2 mt-2"><i class="fw-bold text-success">💡 تبادلات مقترحة:</i></p>`;
+            html += `<hr class="my-2"><p class="small text-muted mb-2 mt-2"><i class="fw-bold text-success">💡 أقل المرشحين أصواتاً الذين يحققون الهدف (بنفس الطائفة والدائرة):</i></p>`;
             listData.suggestions.forEach((suggestion, idx) => {
                 const encodedSwaps = encodeURIComponent(JSON.stringify(suggestion.swaps));
                 html += `
                     <div class="card mb-2 shadow-sm">
                         <div class="card-body py-2 px-3">
                             <div class="d-flex justify-content-between align-items-center mb-2 flex-wrap gap-2">
-                                <div><b>الخيار ${idx + 1}</b> <span class="badge bg-success ms-2">+${suggestion.total_gain.toLocaleString()} صوت</span></div>
+                                <div><b>الخيار ${idx + 1}</b> <span class="badge bg-success ms-2">+${suggestion.seat_gain} مقعد</span> <span class="badge bg-secondary ms-1">مجموع أصوات الداخلين ${suggestion.total_votes.toLocaleString()}</span></div>
                                 <button class="btn btn-sm btn-primary" onclick="executeMultiSwapFromEncoded('${encodedSwaps}')">تنفيذ</button>
                             </div>
                             <ul class="list-group">
@@ -904,7 +907,7 @@
                 suggestion.swaps.forEach(sw => {
                     html += `
                         <li class="list-group-item d-flex justify-content-between align-items-center" style="font-size:0.85rem;">
-                            <span>أخرج <b>${sw.out}</b> وأدخل <b>${sw.in}</b> <span class="text-muted">(${sw.religion})</span></span>
+                            <span>أدخل <b>${sw.in}</b> <span class="text-muted">(${sw.in_votes.toLocaleString()} صوت — ${sw.from_list})</span> بدل <b>${sw.out}</b> <span class="text-muted">(${sw.religion} · ${sw.district})</span></span>
                             <span class="badge bg-success rounded-pill">+${sw.net_gain.toLocaleString()}</span>
                         </li>
                     `;
@@ -933,37 +936,11 @@
             const data = await res.json();
 
             if (data.success) {
-                currentVotesNeeded = {};
+                currentVotesNeeded = {}; refreshCandidatePercents();
                 addLogMessage(`<strong>🔄 Multi-swap:</strong> تم تنفيذ ${swaps.length} تبديلات بنجاح.`, 'log-success');
                 recalcResults();
             }
         } catch (e) { }
-    }
-
-    function applySwapHintFromEl(el) {
-        const card = el.closest('.candidate-card');
-        applySwapHint(card.dataset.name, el.dataset.swapInName, card.dataset.candidateId, el.dataset.swapInId);
-    }
-
-    async function applySwapHint(outName, inName, outId, inId) {
-        try {
-            const res = await fetch('/api/swap_candidates', {
-                method: 'POST', headers: { 'Content-Type': 'application/json' },
-                body: JSON.stringify({
-                    filename: filename, candidate_name: outName, target_name: inName,
-                    candidate_id: outId || null, target_id: inId || null,
-                })
-            });
-            const data = await res.json();
-            if (data.success) {
-                addLogMessage(`<strong>⇄ Swap Applied:</strong> <b>${data.src_name}</b> ↔ <b>${data.target_name}</b>.`, 'log-success');
-                window.location.reload();
-            } else {
-                addLogMessage(`<strong>❌ Error:</strong> ${data.message}`, 'log-error');
-            }
-        } catch (e) {
-            addLogMessage('<strong>❌ Error:</strong> Connection failed.', 'log-error');
-        }
     }
 
     // --- ADVANCED CHATBOT ---
@@ -1037,6 +1014,25 @@
         input.focus();
     }
 
+    let chatContext = {};
+
+    function renderChatSuggestions(list) {
+        if (!list || !list.length) return;
+        const chatBody = document.getElementById("chatBody");
+        const wrap = document.createElement("div");
+        wrap.className = "chat-suggestions";
+        wrap.style.cssText = "display:flex;flex-wrap:wrap;gap:6px;margin:4px 0 8px;";
+        list.forEach(t => {
+            const chip = document.createElement("span");
+            chip.className = "quick-chip";
+            chip.textContent = t;
+            chip.onclick = () => sendQuickMessage(t);
+            wrap.appendChild(chip);
+        });
+        chatBody.appendChild(wrap);
+        chatBody.scrollTop = chatBody.scrollHeight;
+    }
+
     function sendQuickMessage(msg) {
         document.getElementById('chatInput').value = msg;
         sendChatMessage();
@@ -1062,8 +1058,12 @@
                 <li onclick="insertCommand('لائحة')">📋 <code>لائحة [اسم]</code> — تفاصيل لائحة</li>
                 <li onclick="insertCommand('قارن')">⚖️ <code>قارن X مع Y</code> — مقارنة مرشحين</li>
                 <li onclick="insertCommand('ملخص')">📈 <code>ملخص</code> — ملخص التوزيع</li>
+                <li onclick="insertCommand('كم يلزم لائحة')">🧮 <code>كم يلزم [لائحة] مقعدين</code> — أرخص تبديل</li>
+                <li onclick="insertCommand('بأي لائحة يفوز')">🔎 <code>بأي لائحة يفوز [مرشح]</code></li>
+                <li onclick="sendQuickMessage('اقرب الخاسرين')">🎯 <code>اقرب الخاسرين</code></li>
             </ul>
         </div>`;
+        chatContext = {};
         localStorage.removeItem(CHAT_STORAGE_KEY);
     }
 
@@ -1101,11 +1101,14 @@
         try {
             const res = await fetch("/api/chat", {
                 method: "POST", headers: {"Content-Type": "application/json"},
-                body: JSON.stringify({ message: text, filename: filename })
+                body: JSON.stringify({ message: text, filename: filename, context: chatContext })
             });
             const data = await res.json();
             document.getElementById(typingId)?.remove();
+            chatContext = data.context || chatContext;
+            document.querySelectorAll('.chat-suggestions').forEach(el => el.remove());
             appendMessage(data.reply, "bot");
+            renderChatSuggestions(data.suggestions);
             if (data.action === 'swap_done') {
                 setTimeout(() => window.location.reload(), 1500);
             }

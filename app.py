@@ -1,5 +1,6 @@
 from flask import Flask, render_template, abort, request, jsonify, send_file, g
 import pandas as pd
+import numpy as np
 import json
 import os
 import re
@@ -960,38 +961,6 @@ def build_atomic_swaps_for_group(df: pd.DataFrame, target_group: str):
             uniq.append(a)                  #only keep unique swaps (no duplicates)
     return uniq[:12]
 
-def best_swap_for_candidate(df: pd.DataFrame, candidate_row) -> dict:
-    """Single best swap-in for one specific candidate, considering every
-    other candidate in the district -- not capped like
-    build_atomic_swaps_for_group(), which only samples each list's 8
-    weakest candidates against the top 25 outside candidates and then
-    truncates to the 12 best pairs overall. That cap is fine for the
-    combinatorial "how do I gain a whole seat" search, but it means a
-    losing candidate's own best swap can be silently missing from the list
-    (crowded out by other pairs) even though a real one exists -- this
-    checks that one candidate directly so every losing candidate gets an
-    accurate hint.
-    """
-    same_rel = str(candidate_row["RELIGION"])
-    same_dist = str(candidate_row["DISTRICT"])
-    own_votes = int(candidate_row["VOTES"])
-
-    pool = df[
-        (df["GROUP"] != candidate_row["GROUP"])
-        & (df["RELIGION"].astype(str) == same_rel)
-        & (df["DISTRICT"].astype(str) == same_dist)
-        & (df["VOTES"] > own_votes)
-    ].sort_values("VOTES", ascending=False)
-
-    if pool.empty:
-        return None
-    best = pool.iloc[0]
-    return {
-        "out": str(candidate_row["MEMBER"]), "out_id": candidate_row.get("CANDIDATE_ID"),
-        "in": str(best["MEMBER"]), "in_id": best.get("CANDIDATE_ID"),
-        "from_list": str(best["GROUP"]), "net_gain": int(best["VOTES"]) - own_votes,
-    }
-
 def is_valid_combo(combo):
     used_out, used_in = set(), set()
     for s in combo:
@@ -1069,29 +1038,107 @@ def calculate_votes_needed_for_one_group(file_id, df, target_group, target_k):
         needed = ((current_seats_formula + k - 1 + cutoff_remainder) * eq2) - v
     needed = int(max(1, math.ceil(needed)))                                             #calculate the number of additional votes needed for the target group to gain the desired number of seats (k), taking into account whether the group has passed the electoral threshold and the current seat allocation
 
-    atomic_swaps = build_atomic_swaps_for_group(df, target_group)
-    suggestions = []
-
-    if k == 1:
-        for s in atomic_swaps[:5]:
-            sim = simulate_combo_gain(file_id, df, target_group, [s], current_seats_actual)
-            if sim and sim["seat_gain"] >= 1:
-                suggestions.append({"type": "1_swap", "seat_gain": sim["seat_gain"], "total_gain": s["net_gain"], "swaps": [s]})        #simulate the effect of each atomic swap on the number of seats won by the target group and add valid suggestions to the list
-    else:
-        combo_size = min(k, 3)
-        tested = 0
-        for combo in combinations(atomic_swaps, combo_size):
-            if tested >= (300 if k == 2 else 150): break
-            tested += 1
-            if not is_valid_combo(combo): continue
-            total_gain = sum(x["net_gain"] for x in combo)
-            if total_gain < max(1, math.floor(needed * 0.75)): continue
-            sim = simulate_combo_gain(file_id, df, target_group, combo, current_seats_actual)
-            if sim and sim["seat_gain"] >= k:
-                suggestions.append({"type": f"{combo_size}_swap", "seat_gain": sim["seat_gain"], "total_gain": total_gain, "swaps": list(combo)})
-        suggestions = sorted(suggestions, key=lambda x: (x["total_gain"], len(x["swaps"])))[:5]         #sort the suggestions by total gain and number of swaps, and keep only the top 5 suggestions
+    suggestions = find_min_vote_swaps(file_id, df, target_group, k, current_seats_actual, needed)
 
     return {"passed": bool(passed), "current_seats": current_seats_actual, "votes": needed, "suggestions": suggestions}
+
+
+def find_min_vote_swaps(file_id, df, target_group, k, baseline_seats, needed, top_n=5):
+    """Cheapest ways for `target_group` to gain at least `k` seats by
+    swapping in candidates from other lists.
+
+    A swap replaces one of the list's own candidates with an outside
+    candidate of the SAME religion and SAME district (the only swaps the
+    system allows). "Cheapest" means the fewest total votes carried in by
+    the incoming candidates. Every incoming candidate is considered, not
+    just the strongest ones, and solutions of 1, 2 or 3 swaps are compared
+    together.
+    """
+    own = df[df["GROUP"] == target_group]
+    others = df[df["GROUP"] != target_group]
+    if own.empty or others.empty:
+        return []
+
+    swaps = []
+    for _, src in own.iterrows():
+        pool = others[
+            (others["RELIGION"].astype(str) == str(src["RELIGION"]))
+            & (others["DISTRICT"].astype(str) == str(src["DISTRICT"]))
+            & (others["VOTES"] > src["VOTES"])
+        ].sort_values("VOTES")
+        if pool.empty:
+            continue
+        # Keep the cheapest few plus a spread up to the strongest, so both
+        # cheap single swaps and bigger ones for multi-swap combos exist.
+        keep = sorted({int(i) for i in np.linspace(0, len(pool) - 1, min(len(pool), 8))})
+        for i in keep:
+            tgt = pool.iloc[i]
+            swaps.append({
+                "out": str(src["MEMBER"]), "in": str(tgt["MEMBER"]),
+                "out_id": src.get("CANDIDATE_ID"), "in_id": tgt.get("CANDIDATE_ID"),
+                "from_list": strip_list_number(tgt["GROUP"]),
+                "religion": str(src["RELIGION"]), "district": str(src["DISTRICT"]),
+                "out_votes": int(src["VOTES"]), "in_votes": int(tgt["VOTES"]),
+                "net_gain": int(tgt["VOTES"]) - int(src["VOTES"]),
+            })
+    if not swaps:
+        return []
+
+    def cost(combo):
+        return sum(s["in_votes"] for s in combo)
+
+    def key(s):
+        return (s["out"], s["in"])
+
+    found, valid_sets = [], []
+
+    def try_combo(combo):
+        sim = simulate_combo_gain(file_id, df, target_group, combo, baseline_seats)
+        if sim and sim["seat_gain"] >= k:
+            valid_sets.append({key(s) for s in combo})
+            found.append({
+                "type": f"{len(combo)}_swap", "seat_gain": sim["seat_gain"],
+                "total_gain": sum(s["net_gain"] for s in combo),
+                "total_votes": cost(combo), "swaps": list(combo),
+            })
+
+    def contains_valid_subset(combo):
+        keys = {key(s) for s in combo}
+        return any(v < keys for v in valid_sets)
+
+    swaps.sort(key=lambda s: s["in_votes"])
+    for s in swaps[:80]:
+        try_combo([s])
+
+    floor_gain = max(1, math.floor(needed * 0.5))
+    for size, budget in ((2, 60), (3, 40)):
+        combos = []
+        for combo in combinations(swaps[:45], size):
+            if not is_valid_combo(combo):
+                continue
+            if sum(s["net_gain"] for s in combo) < floor_gain:
+                continue
+            combos.append(combo)
+        combos.sort(key=cost)
+        tested = 0
+        for combo in combos:
+            if tested >= budget:
+                break
+            if len(found) >= top_n and cost(combo) >= sorted(f["total_votes"] for f in found)[top_n - 1]:
+                break
+            if contains_valid_subset(combo):
+                continue
+            tested += 1
+            try_combo(combo)
+
+    found.sort(key=lambda f: (f["total_votes"], len(f["swaps"])))
+    unique, seen = [], set()
+    for f in found:
+        incoming = frozenset(s["in"] for s in f["swaps"])
+        if incoming not in seen:      # same incoming candidates, just paired differently
+            seen.add(incoming)
+            unique.append(f)
+    return unique[:top_n]
 
 
 # =========================================================
@@ -1225,12 +1272,20 @@ def make_compare_payload(slug: str):
         )
         payload["chart_json"] = json.dumps(fig, cls=plotly.utils.PlotlyJSONEncoder)
 
-        w18 = set(y18.get("winners_df", pd.DataFrame(columns=["MEMBER"]))["MEMBER"].astype(str).tolist()) if y18.get("available") else set()
-        w22 = set(y22.get("winners_df", pd.DataFrame(columns=["MEMBER"]))["MEMBER"].astype(str).tolist()) if y22.get("available") else set()
+        # The same person is often spelled slightly differently between the
+        # two years' source files (e.g. كرامى vs كرامي), so match winners on a
+        # normalized key rather than the exact text.
+        def winners_by_key(year_info):
+            if not year_info.get("available"):
+                return {}
+            names = year_info.get("winners_df", pd.DataFrame(columns=["MEMBER"]))["MEMBER"].astype(str).tolist()
+            return {normalize_arabic(n).replace(" ", ""): n for n in names}
+
+        w18, w22 = winners_by_key(y18), winners_by_key(y22)
         payload["winner_changes"] = {
-            "kept": sorted(list(w18 & w22)),
-            "new": sorted(list(w22 - w18)),
-            "lost": sorted(list(w18 - w22)),
+            "kept": sorted(w22[k] for k in w18.keys() & w22.keys()),
+            "new": sorted(w22[k] for k in w22.keys() - w18.keys()),
+            "lost": sorted(w18[k] for k in w18.keys() - w22.keys()),
         }
 
     return payload
@@ -1413,16 +1468,6 @@ def region_detail(slug):
     for grp in grouped: grouped[grp].sort(key=lambda x: x["votes"], reverse=True)
     grouped = dict(sorted(grouped.items(), key=lambda i: sum(x["votes"] for x in i[1]), reverse=True))
 
-    # Best available swap-in for each losing candidate, computed individually
-    # (see best_swap_for_candidate) so every losing candidate gets an
-    # accurate hint instead of only whichever pairs survive the combinatorial
-    # suggestion engine's top-12-per-list cap.
-    swap_hints = {}
-    for _, row in df_agg[df_agg["IS_WINNER"] != True].iterrows():
-        hint = best_swap_for_candidate(df_agg, row)
-        if hint:
-            swap_hints[str(row["CANDIDATE_ID"])] = hint
-
     charts_by_district = {}
     districts = df_agg["DISTRICT"].unique() if len(df_agg["DISTRICT"].unique()) > 0 else ["General"]
     chart_global_counter = 0
@@ -1468,7 +1513,7 @@ def region_detail(slug):
         "detail.html", region_name=info["name"], sub_region_name=info["district_label"],
         groups=grouped, file_id=file_id, current_year=selected_year,
         charts_by_district=charts_by_district, total_seats=total_seats,
-        region_slug=slug, all_candidates=all_candidates_sorted, swap_hints=swap_hints
+        region_slug=slug, all_candidates=all_candidates_sorted
     )
 
 @app.route("/compare/<slug>")
@@ -2025,271 +2070,410 @@ def api_find_winning_list():
         "results": results
     })
 
+# ---------------------------------------------------------------------------
+# Election assistant (rule-based, Arabic-normalized, with follow-up context)
+# ---------------------------------------------------------------------------
+_CHAT_STOP = {"كم", "صوت", "اصوات", "لائحه", "قائمه", "مرشح", "من", "ما", "هو", "هي", "في", "عن",
+              "الى", "علي", "على", "ماذا", "هل", "لو", "اذا", "ال", "votes", "list", "of", "the", "for"}
+
+
+def _nrm(text) -> str:
+    """Normalize Arabic text for matching: hamza/ya/kaf variants, ta-marbuta, diacritics, spacing."""
+    s = normalize_arabic(str(text or "")).lower()
+    s = re.sub(r"[ً-ْـ]", "", s)
+    return s.replace("ة", "ه").strip()
+
+
+def _chat_tokens(text) -> list:
+    return [t for t in re.split(r"[^\w]+", _nrm(text)) if t and t not in _CHAT_STOP and len(t) > 1]
+
+
+def _chat_rank_matches(query: str, names: list, limit: int = 5) -> list:
+    """Rank names against a query by token overlap, falling back to difflib similarity."""
+    q_tokens = _chat_tokens(query)
+    if not q_tokens:
+        return []
+    q_norm = _nrm(query)
+    scored = []
+    for name in names:
+        n_tokens = set(_chat_tokens(name))
+        hit = sum(1 for t in q_tokens
+                  if t in n_tokens or any(len(nt) > 2 and (t in nt or nt in t) for nt in n_tokens))
+        if hit == 0:
+            ratio = difflib.SequenceMatcher(None, q_norm, _nrm(name)).ratio()
+            if ratio >= 0.6:
+                scored.append((ratio, name))
+            continue
+        coverage = hit / len(q_tokens)
+        exact_bonus = 0.5 if (q_norm == _nrm(name) or set(q_tokens) == n_tokens) else 0
+        scored.append((coverage + exact_bonus + 0.01 * hit - 0.001 * len(n_tokens), name))
+    scored.sort(key=lambda x: -x[0])
+    return scored[:limit]
+
+
+def _chat_html_card(title: str, body: str) -> str:
+    return f"<div style='font-size:0.82rem;'><b style='color:#667eea;'>{title}</b><br><br>{body}</div>"
+
+
+def _chat_reply(reply, action="none", suggestions=None, context=None):
+    return jsonify({"reply": reply, "action": action, "suggestions": suggestions or [], "context": context or {}})
+
+
+def _chat_help_html(prefix="يمكنني مساعدتك بـ:"):
+    return ("<div style='font-size:0.82rem;'>" + prefix + "<br><br>"
+            "🔍 <b>اسم مرشح</b> — تفاصيله وترتيبه (ثم اسأل «وقائمته؟»)<br>"
+            "📋 <b>لائحة [اسم]</b> — مرشحو اللائحة وأصواتها<br>"
+            "🏆 <b>من فاز</b> / <b>من فاز [لائحة]</b> / <b>فائزو [طائفة]</b><br>"
+            "🧮 <b>كم يلزم [لائحة] مقعدين</b> — الأصوات وأرخص تبديل<br>"
+            "🔎 <b>بأي لائحة يفوز [مرشح]</b><br>"
+            "🎯 <b>اقرب الخاسرين</b> — من كاد يفوز<br>"
+            "⚖️ <b>قارن X مع Y</b> — 🔄 <b>بدل X مع Y</b><br>"
+            "📊 <b>ملخص</b> — <b>حاصل</b> — <b>اعلى 5</b></div>")
+
+
 @app.route("/api/chat", methods=["POST"])
 def api_chat():
     data = request.json or {}
     msg, fid = str(data.get("message", "")).strip(), data.get("filename")
+    ctx_in = data.get("context") or {}
     df = get_candidates_df(fid)
     if df is None:
-        return jsonify({"reply": "عذراً، البيانات غير متوفرة حالياً.", "action": "none"})
+        return _chat_reply("عذراً، البيانات غير متوفرة حالياً.")
 
-    msg_lower = msg.lower()
-    all_names = df["MEMBER"].astype(str).tolist()
+    m_norm = _nrm(msg)
+    num_seats = sum(get_quota(fid).get("rel_limits", {}).values())
+    total_votes = int(df["VOTES"].sum())
+    groups_all = df["GROUP"].unique().tolist()
+    group_labels = {g: strip_list_number(g) for g in groups_all}
+    ctx = {"candidate": ctx_in.get("candidate"), "group": ctx_in.get("group")}
+    member_set = set(df["MEMBER"].astype(str))
 
-    def fuzzy_find(name_input):
-        """Find closest candidate name using fuzzy matching."""
-        name_input = name_input.strip()
-        # Exact match first
-        exact = [n for n in all_names if n == name_input]
-        if exact: return exact[0]
-        # Substring match
-        substr = [n for n in all_names if name_input in n or n in name_input]
-        if len(substr) == 1: return substr[0]
-        # Fuzzy match
-        matches = difflib.get_close_matches(name_input, all_names, n=1, cutoff=0.5)
-        return matches[0] if matches else None
+    def has(*words):
+        return any(_nrm(w) in m_norm for w in words)
 
-    # --- 1) SWAP COMMAND: "بدل X مع Y" ---
-    swap_patterns = [
-        r"بدل\s+(.+?)\s+مع\s+(.+)",
-        r"بدّل\s+(.+?)\s+مع\s+(.+)",
-        r"تبديل\s+(.+?)\s+مع\s+(.+)",
-        r"swap\s+(.+?)\s+with\s+(.+)",
-    ]
-    for pattern in swap_patterns:
+    def row_by_name(name):
+        return df[df["MEMBER"] == name].iloc[0]
+
+    def resolve_candidate(text, allow_context=True):
+        """Return (row, None) | (None, ambiguity_reply) | (None, None)."""
+        text = text.strip()
+        if allow_context and ctx["candidate"] in member_set and (
+                not text or re.fullmatch(r"(هو|هي|له|لها|عنه|عنها|نفسه|نفسها)", _nrm(text))):
+            return row_by_name(ctx["candidate"]), None
+        ranked = _chat_rank_matches(text, df["MEMBER"].astype(str).tolist(), 6)
+        if not ranked:
+            return None, None
+        best = ranked[0][0]
+        uniq = list(dict.fromkeys(n for s, n in ranked if s >= best - 0.05))
+        if len(uniq) > 1 and best < 1.4:
+            return None, _chat_reply("🤔 وجدت أكثر من مرشح بهذا الاسم، أيهم تقصد؟",
+                                     suggestions=[f"أصوات {n}" for n in uniq[:4]], context=ctx)
+        return row_by_name(ranked[0][1]), None
+
+    def resolve_group(text, allow_context=True):
+        text = re.sub(r"\(\s*\d+\s*\)", " ", text).strip()
+        if not text:
+            if allow_context and ctx["group"] in groups_all:
+                return ctx["group"], None
+            return None, None
+        ranked = _chat_rank_matches(text, [group_labels[g] for g in groups_all], 5)
+        if not ranked:
+            return None, None
+        label_to_group = {group_labels[g]: g for g in groups_all}
+        best = ranked[0][0]
+        close = list(dict.fromkeys(n for s, n in ranked if s >= best - 0.05))
+        if len(close) > 1 and best < 1.4:
+            return None, _chat_reply("🤔 أي لائحة تقصد؟", suggestions=[f"لائحة {n}" for n in close[:4]], context=ctx)
+        return label_to_group[ranked[0][1]], None
+
+    def strip_keywords(text, words):
+        out = text
+        for w in words:
+            out = re.sub(re.escape(w), " ", out, flags=re.IGNORECASE)
+        return re.sub(r"\s+", " ", out).strip()
+
+    def group_seats(g):
+        return int(df[(df["GROUP"] == g) & (df["IS_WINNER"] == True)].shape[0])
+
+    def candidate_card(row):
+        votes = int(row["VOTES"])
+        grp_total = int(df[df["GROUP"] == row["GROUP"]]["VOTES"].sum())
+        pct = round(votes / max(1, grp_total) * 100, 1)
+        is_win = bool(row["IS_WINNER"])
+        color = "#43a047" if is_win else "#e53935"
+        peers = df[(df["DISTRICT"] == row["DISTRICT"]) & (df["RELIGION"] == row["RELIGION"])]
+        rank_in_seat = int((peers["VOTES"] > votes).sum()) + 1
+        html = "<div style='font-size:0.82rem;'>"
+        html += f"<div style='background:#f8f9fc;padding:10px;border-radius:10px;border-right:3px solid {color};'>"
+        html += f"<b style='font-size:0.9rem;'>{row['MEMBER']}</b> <span style='color:{color};'>{'🏆 فائز' if is_win else '❌ خاسر'}</span><br>"
+        html += f"<span style='color:#6c757d;font-size:0.75rem;'>{row['RELIGION']} • {row['DISTRICT']}</span><br><br>"
+        html += f"📋 اللائحة: <b>{group_labels[row['GROUP']]}</b><br>"
+        html += f"🗳️ الأصوات: <b>{votes:,}</b> ({pct}% من لائحته)<br>"
+        html += f"🥇 ترتيبه بين مرشحي مقعده: <b>{rank_in_seat}</b> من {len(peers)}<br>"
+        if not is_win:
+            w_peers = peers[peers["IS_WINNER"] == True]
+            if not w_peers.empty:
+                gap = int(w_peers["VOTES"].min()) - votes
+                if gap > 0:
+                    html += f"📉 يفصله عن أقل فائز بنفس المقعد: <b>{gap:,}</b> صوت<br>"
+        html += (f"<div style='background:#e0e3e8;border-radius:4px;height:5px;margin-top:4px;'><div style='background:linear-gradient(90deg,#667eea,#764ba2);"
+                 f"width:{min(100, pct)}%;height:100%;border-radius:4px;'></div></div></div></div>")
+        return html
+
+    def list_reply(grp):
+        ctx["group"] = grp
+        gdf = df[df["GROUP"] == grp].sort_values("VOTES", ascending=False)
+        total = int(gdf["VOTES"].sum())
+        html = f"المجموع: <b>{total:,}</b> صوت ({round(total / max(1, total_votes) * 100, 1)}%) | الفائزون: <b>{group_seats(grp)}</b><br><br>"
+        for i, (_, r) in enumerate(gdf.iterrows(), 1):
+            html += (f"{'✅' if r['IS_WINNER'] else '•'} <b>{i}.</b> {r['MEMBER']} — <b>{int(r['VOTES']):,}</b> "
+                     f"<span style='color:#6c757d;font-size:0.7rem;'>{r['RELIGION']}</span><br>")
+        return _chat_reply(_chat_html_card(f"📋 {group_labels[grp]}", html),
+                           suggestions=[f"كم يلزم {group_labels[grp]} مقعد", f"من فاز {group_labels[grp]}"], context=ctx)
+
+    def remember_candidate(row):
+        ctx["candidate"] = str(row["MEMBER"])
+        ctx["group"] = str(row["GROUP"])
+
+    # --- help ---
+    if re.fullmatch(r"\s*(مساعده|help|\?|؟)\s*", m_norm):
+        return _chat_reply(_chat_help_html(), suggestions=["ملخص", "من فاز", "اقرب الخاسرين", "اعلى المرشحين"], context=ctx)
+
+    # --- follow-ups about the remembered candidate/list ("وقائمته؟", "ولائحتها") ---
+    if ctx["group"] in groups_all and re.fullmatch(r"\s*و?\s*(لائحته|لائحتها|قائمته|قائمتها|لايحته)\s*", m_norm.replace("؟", "").replace("?", "")):
+        return list_reply(ctx["group"])
+
+    # --- 1) swap ---
+    for pattern in (r"(?:بدل|بدّل|تبديل|تبادل)\s+(.+?)\s+(?:مع|و)\s+(.+)", r"swap\s+(.+?)\s+with\s+(.+)"):
         m = re.search(pattern, msg, re.IGNORECASE)
         if m:
-            src_input, tgt_input = m.group(1).strip(), m.group(2).strip()
-            src_name = fuzzy_find(src_input)
-            tgt_name = fuzzy_find(tgt_input)
-
-            if not src_name:
-                return jsonify({"reply": f"❌ لم أجد مرشحاً باسم <b>{src_input}</b>.", "action": "none"})
-            if not tgt_name:
-                return jsonify({"reply": f"❌ لم أجد مرشحاً باسم <b>{tgt_input}</b>.", "action": "none"})
-
-            src_row = df[df["MEMBER"] == src_name].iloc[0]
-            tgt_row = df[df["MEMBER"] == tgt_name].iloc[0]
-
-            if str(src_row["RELIGION"]) != str(tgt_row["RELIGION"]) or str(src_row["DISTRICT"]) != str(tgt_row["DISTRICT"]):
-                return jsonify({
-                    "reply": f"❌ لا يمكن التبادل بين <b>{src_name}</b> ({src_row['RELIGION']} - {src_row['DISTRICT']}) و <b>{tgt_name}</b> ({tgt_row['RELIGION']} - {tgt_row['DISTRICT']}).<br>يجب أن يكونا من نفس الطائفة والدائرة.",
-                    "action": "none"
-                })
-
-            # Persist the swap in PostgreSQL.
-            sg, tg = str(src_row["GROUP"]), str(tgt_row["GROUP"])
+            a_row, amb = resolve_candidate(m.group(1), False)
+            if amb: return amb
+            b_row, amb = resolve_candidate(m.group(2), False)
+            if amb: return amb
+            if a_row is None: return _chat_reply(f"❌ لم أجد مرشحاً باسم <b>{m.group(1).strip()}</b>.", context=ctx)
+            if b_row is None: return _chat_reply(f"❌ لم أجد مرشحاً باسم <b>{m.group(2).strip()}</b>.", context=ctx)
+            if str(a_row["RELIGION"]) != str(b_row["RELIGION"]) or str(a_row["DISTRICT"]) != str(b_row["DISTRICT"]):
+                return _chat_reply(
+                    f"❌ لا يمكن التبادل بين <b>{a_row['MEMBER']}</b> ({a_row['RELIGION']} - {a_row['DISTRICT']}) و <b>{b_row['MEMBER']}</b> ({b_row['RELIGION']} - {b_row['DISTRICT']}).<br>يجب أن يكونا من نفس الطائفة والدائرة.",
+                    context=ctx)
+            if a_row["GROUP"] == b_row["GROUP"]:
+                return _chat_reply("ℹ️ المرشحان في اللائحة نفسها، لا حاجة للتبادل.", context=ctx)
+            sg, tg = str(a_row["GROUP"]), str(b_row["GROUP"])
             try:
-                swap_candidate_groups_db(fid, src_name, tgt_name)
+                swap_candidate_groups_db(fid, a_row["MEMBER"], b_row["MEMBER"],
+                                         source_id=str(a_row["CANDIDATE_ID"]), target_id=str(b_row["CANDIDATE_ID"]))
                 recompute_winners(fid)
             except Exception as exc:
-                return jsonify({"reply": f"❌ فشل تحديث قاعدة البيانات: {exc}", "action": "none"})
+                return _chat_reply(f"❌ فشل تحديث قاعدة البيانات: {exc}", context=ctx)
+            return _chat_reply(
+                f"✅ تم التبادل وحفظه!<br><b>{a_row['MEMBER']}</b> ← {group_labels[tg]}<br><b>{b_row['MEMBER']}</b> ← {group_labels[sg]}",
+                action="swap_done", context=ctx)
 
-            return jsonify({
-                "reply": f"✅ تم التبادل وحفظه في قاعدة البيانات!<br><b>{src_name}</b> ← {tg}<br><b>{tgt_name}</b> ← {sg}",
-                "action": "swap_done"
-            })
-
-    # --- 2) QUOTIENT QUERY ---
-    if "حاصل" in msg:
-        num_seats = sum(get_quota(fid).get("rel_limits", {}).values())
-        if num_seats == 0:
-            return jsonify({"reply": "لا توجد بيانات مقاعد.", "action": "none"})
-        eq1 = df["VOTES"].sum() / num_seats
-        return jsonify({"reply": f"📊 الحاصل الانتخابي يبلغ حالياً <b>{int(eq1):,}</b> صوتاً.", "action": "none"})
-
-    # --- 3) WINNER QUERY: "فائزين" or "من فاز" ---
-    if any(w in msg for w in ["فائز", "فاز", "winners", "الفائز", "فائزين", "من ربح"]):
-        winners = df[df["IS_WINNER"] == True]
-        if winners.empty:
-            return jsonify({"reply": "لا يوجد فائزون حالياً. اضغط Recalculate أولاً.", "action": "none"})
-
-        by_group = winners.groupby("GROUP")["MEMBER"].apply(list).to_dict()
-        html = f"🏆 <b>الفائزون ({len(winners)} مقعد):</b><br><br>"
-        for grp, names in sorted(by_group.items(), key=lambda x: len(x[1]), reverse=True):
-            html += f"<b style='color:#0d6efd;'>{strip_list_number(grp)}</b> ({len(names)}):<br>"
-            for n in names:
-                html += f"  ✅ {n}<br>"
-            html += "<br>"
-        return jsonify({"reply": html, "action": "none"})
-
-    # --- 4) COMPARE COMMAND: "قارن X مع Y" ---
-    compare_patterns = [
-        r"قارن\s+(.+?)\s+مع\s+(.+)",
-        r"compare\s+(.+?)\s+with\s+(.+)",
-        r"مقارنة\s+(.+?)\s+و\s+(.+)",
-    ]
-    for pattern in compare_patterns:
+    # --- 2) compare two candidates ---
+    for pattern in (r"(?:قارن|مقارنة|مقارنه)\s+(.+?)\s+(?:مع|و)\s+(.+)", r"compare\s+(.+?)\s+with\s+(.+)"):
         m = re.search(pattern, msg, re.IGNORECASE)
         if m:
-            name_a_input, name_b_input = m.group(1).strip(), m.group(2).strip()
-            name_a = fuzzy_find(name_a_input)
-            name_b = fuzzy_find(name_b_input)
-            if not name_a:
-                return jsonify({"reply": f"❌ لم أجد مرشحاً باسم <b>{name_a_input}</b>.", "action": "none"})
-            if not name_b:
-                return jsonify({"reply": f"❌ لم أجد مرشحاً باسم <b>{name_b_input}</b>.", "action": "none"})
-            row_a = df[df["MEMBER"] == name_a].iloc[0]
-            row_b = df[df["MEMBER"] == name_b].iloc[0]
-            votes_a, votes_b = int(row_a["VOTES"]), int(row_b["VOTES"])
-            diff = abs(votes_a - votes_b)
-            leader = name_a if votes_a >= votes_b else name_b
-            status_a = "🏆" if row_a["IS_WINNER"] else "❌"
-            status_b = "🏆" if row_b["IS_WINNER"] else "❌"
+            a_row, amb = resolve_candidate(m.group(1), False)
+            if amb: return amb
+            b_row, amb = resolve_candidate(m.group(2), False)
+            if amb: return amb
+            if a_row is None: return _chat_reply(f"❌ لم أجد مرشحاً باسم <b>{m.group(1).strip()}</b>.", context=ctx)
+            if b_row is None: return _chat_reply(f"❌ لم أجد مرشحاً باسم <b>{m.group(2).strip()}</b>.", context=ctx)
+            va, vb = int(a_row["VOTES"]), int(b_row["VOTES"])
+            leader = a_row["MEMBER"] if va >= vb else b_row["MEMBER"]
 
-            # Build comparison card
-            html = f"<div style='font-size:0.82rem;'>"
-            html += f"<b style='color:#667eea;'>⚖️ مقارنة بين مرشحين</b><br><br>"
-            html += f"<div style='display:flex;gap:8px;'>"
-            html += f"<div style='flex:1;background:#f8f9fc;padding:8px;border-radius:8px;border-right:3px solid #667eea;'>"
-            html += f"<b>{name_a}</b> {status_a}<br>"
-            html += f"<span style='color:#6c757d;font-size:0.75rem;'>{row_a['RELIGION']} • {row_a['DISTRICT']}</span><br>"
-            html += f"اللائحة: {strip_list_number(row_a['GROUP'])}<br>"
-            html += f"الأصوات: <b>{votes_a:,}</b>"
-            html += f"</div>"
-            html += f"<div style='flex:1;background:#f8f9fc;padding:8px;border-radius:8px;border-right:3px solid #764ba2;'>"
-            html += f"<b>{name_b}</b> {status_b}<br>"
-            html += f"<span style='color:#6c757d;font-size:0.75rem;'>{row_b['RELIGION']} • {row_b['DISTRICT']}</span><br>"
-            html += f"اللائحة: {strip_list_number(row_b['GROUP'])}<br>"
-            html += f"الأصوات: <b>{votes_b:,}</b>"
-            html += f"</div></div>"
-            html += f"<br><b>الفرق:</b> {diff:,} صوت لصالح <b>{leader}</b>"
+            def side(r, v, color):
+                return (f"<div style='flex:1;background:#f8f9fc;padding:8px;border-radius:8px;border-right:3px solid {color};'>"
+                        f"<b>{r['MEMBER']}</b> {'🏆' if r['IS_WINNER'] else '❌'}<br>"
+                        f"<span style='color:#6c757d;font-size:0.75rem;'>{r['RELIGION']} • {r['DISTRICT']}</span><br>"
+                        f"اللائحة: {group_labels[r['GROUP']]}<br>الأصوات: <b>{v:,}</b></div>")
+            html = "<div style='font-size:0.82rem;'><b style='color:#667eea;'>⚖️ مقارنة بين مرشحين</b><br><br><div style='display:flex;gap:8px;'>"
+            html += side(a_row, va, "#667eea") + side(b_row, vb, "#764ba2") + "</div>"
+            html += f"<br><b>الفرق:</b> {abs(va - vb):,} صوت لصالح <b>{leader}</b>"
+            can = (str(a_row["RELIGION"]) == str(b_row["RELIGION"]) and str(a_row["DISTRICT"]) == str(b_row["DISTRICT"])
+                   and a_row["GROUP"] != b_row["GROUP"])
+            html += ("<br><span style='color:#43a047;'>✅ يمكن تبادلهما (نفس الطائفة والدائرة)</span>" if can
+                     else "<br><span style='color:#e53935;'>❌ لا يمكن تبادلهما</span>") + "</div>"
+            return _chat_reply(html, suggestions=[f"بدل {a_row['MEMBER']} مع {b_row['MEMBER']}"] if can else [], context=ctx)
 
-            can_swap = str(row_a["RELIGION"]) == str(row_b["RELIGION"]) and str(row_a["DISTRICT"]) == str(row_b["DISTRICT"])
-            if can_swap:
-                html += f"<br><span style='color:#43a047;'>✅ يمكن تبادلهما (نفس الطائفة والدائرة)</span>"
-            else:
-                html += f"<br><span style='color:#e53935;'>❌ لا يمكن تبادلهما (طائفة أو دائرة مختلفة)</span>"
-            html += "</div>"
-            return jsonify({"reply": html, "action": "none"})
-
-    # --- 5) SUMMARY COMMAND: "ملخص" ---
-    if any(w in msg for w in ["ملخص", "summary", "توزيع", "إحصائيات"]):
-        num_seats = sum(get_quota(fid).get("rel_limits", {}).values())
-        total_votes = int(df["VOTES"].sum())
-        total_candidates = len(df)
-        groups = df["GROUP"].unique()
-        winners = df[df["IS_WINNER"] == True]
-
-        html = "<div style='font-size:0.82rem;'>"
-        html += f"<b style='color:#667eea;'>📊 ملخص الدائرة</b><br><br>"
-        html += f"👥 المرشحون: <b>{total_candidates}</b><br>"
-        html += f"🗳️ مجموع الأصوات: <b>{total_votes:,}</b><br>"
-        html += f"💺 المقاعد: <b>{num_seats}</b><br>"
-        html += f"📋 عدد اللوائح: <b>{len(groups)}</b><br>"
-        if num_seats > 0:
-            eq = total_votes / num_seats
-            html += f"📐 الحاصل الانتخابي: <b>{int(eq):,}</b><br>"
-        html += f"<br><b style='color:#43a047;'>🏆 توزيع المقاعد:</b><br>"
-
-        if not winners.empty:
-            by_group = winners.groupby("GROUP")["MEMBER"].count().sort_values(ascending=False)
-            for grp, cnt in by_group.items():
-                grp_total = int(df[df["GROUP"] == grp]["VOTES"].sum())
-                bar_width = int((cnt / max(1, num_seats)) * 100)
-                html += f"<div style='margin:3px 0;'>"
-                html += f"<div style='display:flex;justify-content:space-between;font-size:0.78rem;'><span>{strip_list_number(grp)}</span><span><b>{int(cnt)}</b> مقعد • {grp_total:,} صوت</span></div>"
-                html += f"<div style='background:#e0e3e8;border-radius:4px;height:6px;margin-top:2px;'>"
-                html += f"<div style='background:linear-gradient(90deg,#667eea,#764ba2);width:{bar_width}%;height:100%;border-radius:4px;'></div>"
-                html += f"</div></div>"
+    # --- 3) votes needed / cheapest swaps for a list ---
+    if has("كم يلزم", "كم يحتاج", "شو يلزم", "ماذا يلزم", "احتاج", "يحتاج", "لتربح", "لتفوز", "مقعد اضافي", "مقعدا اضافيا", "يلزم"):
+        k = 1
+        km = re.search(r"([123])\s*(?:مقعد|مقاعد|seat)", m_norm)
+        if km:
+            k = int(km.group(1))
+        elif has("مقعدين"):
+            k = 2
+        elif has("ثلاثه مقاعد", "ثلاث مقاعد"):
+            k = 3
+        text = strip_keywords(msg, ["كم", "يلزم", "يحتاج", "احتاج", "لائحة", "لائحه", "قائمة", "مقعدين", "مقعد", "مقاعد",
+                                     "اضافي", "إضافي", "لتربح", "لتفوز", "شو", "ماذا", "الى", "إلى"])
+        text = re.sub(r"[123]", " ", text).strip()
+        grp, amb = resolve_group(text)
+        if amb: return amb
+        if grp is None:
+            return _chat_reply("أي لائحة تقصد؟ مثال: <code>كم يلزم لائحة الجبل مقعد</code>", context=ctx)
+        ctx["group"] = grp
+        res = calculate_votes_needed_for_one_group(fid, df, grp, k)
+        if not res:
+            return _chat_reply(f"لا يمكن حساب ذلك للائحة <b>{group_labels[grp]}</b> (يتجاوز عدد المقاعد الممكن).", context=ctx)
+        html = f"<div style='font-size:0.82rem;'><b style='color:#667eea;'>🧮 {group_labels[grp]}</b><br>"
+        html += f"المقاعد الحالية: <b>{res['current_seats']}</b><br>لكسب <b>{k}</b> مقعد إضافي يلزمها ≈ <b>{res['votes']:,}</b> صوت.<br>"
+        sugg = res.get("suggestions") or []
+        if sugg:
+            best = sugg[0]
+            html += f"<br><b style='color:#43a047;'>أرخص تبديل:</b> (مجموع {int(best['total_votes']):,} صوت)<br>"
+            for s in best["swaps"]:
+                html += (f"• <b>{s['in']}</b> ({int(s['in_votes']):,}) من {s['from_list']} ← يحل محل "
+                         f"<b>{s['out']}</b> ({s['religion']} • {s['district']})<br>")
         else:
-            html += "لم يتم حساب النتائج بعد. اضغط <b>Recalculate</b>."
+            html += "<br>لا يوجد تبديل ضمن قيود الطائفة والدائرة يحقق ذلك.<br>"
         html += "</div>"
-        return jsonify({"reply": html, "action": "none"})
+        return _chat_reply(html, suggestions=[f"كم يلزم {group_labels[grp]} {n} مقعد" for n in (1, 2, 3) if n != k], context=ctx)
 
-    if any(w in msg for w in ["أصوات", "صوت", "كم", "votes"]):
-        best_match = None
-        best_score = 0
-        for name in all_names:
-            if name in msg:
-                if len(name) > best_score:
-                    best_match = name
-                    best_score = len(name)
-        if not best_match:
-            cleaned = re.sub(r"(أصوات|صوت|كم|votes)\s*", "", msg).strip()
-            if cleaned:
-                best_match = fuzzy_find(cleaned)
-
-        if best_match:
-            row = df[df["MEMBER"] == best_match].iloc[0]
-            is_winner = bool(row["IS_WINNER"])
-            status_icon = "🏆" if is_winner else "❌"
-            status_text = "فائز" if is_winner else "خاسر"
-            status_color = "#43a047" if is_winner else "#e53935"
-            votes = int(row["VOTES"])
-            total_in_list = int(df[df["GROUP"] == row["GROUP"]]["VOTES"].sum())
-            pct = round((votes / max(1, total_in_list)) * 100, 1)
-
-            html = f"<div style='font-size:0.82rem;'>"
-            html += f"<div style='background:#f8f9fc;padding:10px;border-radius:10px;border-right:3px solid {status_color};'>"
-            html += f"<b style='font-size:0.9rem;'>{best_match}</b> <span style='color:{status_color};'>{status_icon} {status_text}</span><br>"
-            html += f"<span style='color:#6c757d;font-size:0.75rem;'>{row['RELIGION']} • {row['DISTRICT']}</span><br><br>"
-            html += f"📋 اللائحة: <b>{strip_list_number(row['GROUP'])}</b><br>"
-            html += f"🗳️ الأصوات: <b>{votes:,}</b> ({pct}% من لائحته)<br>"
-            html += f"<div style='background:#e0e3e8;border-radius:4px;height:5px;margin-top:4px;'>"
-            html += f"<div style='background:linear-gradient(90deg,#667eea,#764ba2);width:{min(100,pct)}%;height:100%;border-radius:4px;'></div>"
-            html += f"</div>"
-            html += "</div></div>"
-            return jsonify({"reply": html, "action": "none"})
-
-    # --- 7) LIST QUERY: "لائحة X" ---
-    if any(w in msg for w in ["لائحة", "list", "قائمة"]):
-        for grp in df["GROUP"].unique():
-            if grp.lower() in msg_lower or msg_lower in grp.lower():
-                grp_df = df[df["GROUP"] == grp].sort_values("VOTES", ascending=False)
-                total = int(grp_df["VOTES"].sum())
-                winners_count = int(grp_df["IS_WINNER"].sum())
-                num_seats = sum(get_quota(fid).get("rel_limits", {}).values())
-                eq = total / max(1, num_seats) if num_seats > 0 else 0
-
-                html = f"<div style='font-size:0.82rem;'>"
-                html += f"<b style='color:#667eea;'>📋 {strip_list_number(grp)}</b><br>"
-                html += f"المجموع: <b>{total:,}</b> صوت | الفائزون: <b>{winners_count}</b><br>"
-                if num_seats > 0:
-                    pct = round((total / max(1, df["VOTES"].sum())) * 100, 1)
-                    html += f"نسبة الأصوات: <b>{pct}%</b><br>"
-                html += "<br>"
-                for idx, (_, r) in enumerate(grp_df.iterrows()):
-                    icon = "✅" if r["IS_WINNER"] else "•"
-                    rank = idx + 1
-                    html += f"{icon} <b>{rank}.</b> {r['MEMBER']} — <b>{int(r['VOTES']):,}</b><br>"
-                html += "</div>"
-                return jsonify({"reply": html, "action": "none"})
-
-    # --- 8) TOP CANDIDATES: "أعلى" or "ترتيب" ---
-    if any(w in msg for w in ["أعلى", "top", "ترتيب", "أكثر"]):
-        top_n = 10
-        top_df = df.sort_values("VOTES", ascending=False).head(top_n)
-        max_votes = int(top_df.iloc[0]["VOTES"]) if not top_df.empty else 1
-        html = f"<div style='font-size:0.82rem;'>"
-        html += f"<b style='color:#667eea;'>🏅 أعلى {top_n} مرشحين</b><br><br>"
-        for idx, (_, r) in enumerate(top_df.iterrows()):
-            rank = idx + 1
-            votes = int(r["VOTES"])
-            bar_w = int((votes / max(1, max_votes)) * 100)
-            icon = "🏆" if r["IS_WINNER"] else ""
-            html += f"<div style='margin-bottom:4px;'>"
-            html += f"<b>{rank}.</b> {r['MEMBER']} {icon} — <b>{votes:,}</b>"
-            html += f" <span style='color:#6c757d;font-size:0.7rem;'>({strip_list_number(r['GROUP'])})</span>"
-            html += f"<div style='background:#e0e3e8;border-radius:3px;height:4px;margin-top:1px;'>"
-            html += f"<div style='background:linear-gradient(90deg,#667eea,#764ba2);width:{bar_w}%;height:100%;border-radius:3px;'></div>"
-            html += f"</div></div>"
+    # --- 4) which list would X win in ---
+    if has("باي لائحه", "بأي لائحه", "في اي لائحه", "اي لائحه يفوز", "اي لائحه تفوز"):
+        text = strip_keywords(msg, ["بأي", "باي", "في أي", "في اي", "أي", "اي", "لائحة", "لائحه", "يفوز", "تفوز", "سيفوز",
+                                     "لو", "إذا", "اذا", "؟", "?"])
+        row, amb = resolve_candidate(text)
+        if amb: return amb
+        if row is None:
+            return _chat_reply("لم أفهم اسم المرشح. مثال: <code>بأي لائحة يفوز [اسم]</code>", context=ctx)
+        remember_candidate(row)
+        try:
+            with app.test_request_context(json={"filename": fid, "candidate_name": row["MEMBER"]}):
+                resp = api_find_winning_list()
+            payload = resp.get_json()
+        except Exception as exc:
+            return _chat_reply(f"❌ تعذر الحساب: {exc}", context=ctx)
+        wins = [r for r in payload.get("results", []) if r.get("wins")]
+        html = (f"<div style='font-size:0.82rem;'><b style='color:#667eea;'>🔎 {row['MEMBER']}</b> "
+                f"(حالياً: {group_labels[row['GROUP']]}، {'فائز' if row['IS_WINNER'] else 'خاسر'})<br><br>")
+        if wins:
+            html += "<b style='color:#43a047;'>يفوز إذا كان في:</b><br>" + "".join(
+                f"✅ {w['group']}{' (الحالية)' if w.get('is_current') else ''}<br>" for w in wins)
+        else:
+            html += "لا يفوز في أي لائحة ضمن قيود التبديل.<br>"
         html += "</div>"
-        return jsonify({"reply": html, "action": "none"})
+        return _chat_reply(html, suggestions=[f"أصوات {row['MEMBER']}"], context=ctx)
 
-    # --- FALLBACK ---
-    return jsonify({
-        "reply": "<div style='font-size:0.82rem;'>يمكنني مساعدتك بـ:<br><br>"
-                 " لتبديل مرشحين<br>"
-                 " لمقارنة مرشحين<br>"
-                 "الحاصل الانتخابي<br>"
-                 "من فاز — عرض الفائزين<br>"
-                 "أصوات [اسم] — تفاصيل مرشح<br>"
-                 "لائحة [اسم] — تفاصيل لائحة<br>"
-                 "ملخص — ملخص توزيع المقاعد<br>"
-                 "أعلى — أعلى 10 مرشحين</div>",
-        "action": "none"
-    })
+    # --- 5) closest losers ---
+    if has("اقرب الخاسرين", "اقرب خاسر", "كاد يفوز", "كادوا", "الخاسرين", "closest"):
+        rows = []
+        for (dist, rel), peers in df.groupby(["DISTRICT", "RELIGION"]):
+            w = peers[peers["IS_WINNER"] == True]
+            lo = peers[peers["IS_WINNER"] != True]
+            if w.empty or lo.empty:
+                continue
+            lowest_w = w.sort_values("VOTES").iloc[0]
+            top_l = lo.sort_values("VOTES", ascending=False).iloc[0]
+            rows.append((int(lowest_w["VOTES"]) - int(top_l["VOTES"]), top_l, lowest_w, dist, rel))
+        rows.sort(key=lambda x: abs(x[0]))
+        if not rows:
+            return _chat_reply("لا توجد بيانات كافية.", context=ctx)
+        html = ""
+        for gap, lo, w, dist, rel in rows[:6]:
+            html += f"❌ <b>{lo['MEMBER']}</b> ({group_labels[lo['GROUP']]}) — {rel} • {dist}<br>"
+            html += f"&nbsp;&nbsp;&nbsp;&nbsp;أصواته أقل من <b>{w['MEMBER']}</b> بـ <b>{abs(gap):,}</b> صوت<br>"
+        return _chat_reply(_chat_html_card("🎯 أقرب الخاسرين إلى مقعد", html), suggestions=["ملخص", "من فاز"], context=ctx)
+
+    # --- 6) quotient ---
+    if has("حاصل"):
+        if num_seats == 0:
+            return _chat_reply("لا توجد بيانات مقاعد.", context=ctx)
+        return _chat_reply(f"📊 الحاصل الانتخابي ≈ <b>{int(total_votes / num_seats):,}</b> صوتاً ({total_votes:,} صوت ÷ {num_seats} مقعد).",
+                           suggestions=["ملخص", "من فاز"], context=ctx)
+
+    # --- 7) winners (all / by religion / by list) ---
+    religions = sorted({str(r) for r in df["RELIGION"].unique()})
+    rel_hit = next((r for r in religions if len(_nrm(r)) > 2 and _nrm(r) in m_norm), None)
+    if has("فائز", "فاز", "winners", "من ربح", "نواب"):
+        winners = df[df["IS_WINNER"] == True]
+        if winners.empty:
+            return _chat_reply("لا يوجد فائزون حالياً. اضغط Recalculate أولاً.", context=ctx)
+        if rel_hit:
+            sub = winners[winners["RELIGION"] == rel_hit].sort_values("VOTES", ascending=False)
+            html = "".join(f"✅ <b>{r['MEMBER']}</b> — {int(r['VOTES']):,} ({group_labels[r['GROUP']]}) • {r['DISTRICT']}<br>"
+                           for _, r in sub.iterrows()) or "لا يوجد."
+            return _chat_reply(_chat_html_card(f"🏆 فائزو {rel_hit} ({len(sub)})", html), suggestions=["ملخص"], context=ctx)
+        text = strip_keywords(msg, ["من", "فاز", "فائزين", "الفائزين", "فائزو", "لائحة", "لائحه", "في", "winners", "?", "؟"])
+        target_grp = None
+        if _chat_tokens(text):
+            target_grp, amb = resolve_group(text, False)
+            if amb: return amb
+        if target_grp is not None:
+            ctx["group"] = target_grp
+            sub = winners[winners["GROUP"] == target_grp].sort_values("VOTES", ascending=False)
+            html = "".join(f"✅ {r['MEMBER']} — {int(r['VOTES']):,} • {r['RELIGION']}<br>" for _, r in sub.iterrows()) or "لا فائزين في هذه اللائحة."
+            return _chat_reply(_chat_html_card(f"🏆 فائزو {group_labels[target_grp]} ({len(sub)})", html),
+                               suggestions=[f"لائحة {group_labels[target_grp]}", f"كم يلزم {group_labels[target_grp]} مقعد"], context=ctx)
+        html = ""
+        by_group = winners.groupby("GROUP")["MEMBER"].apply(list).to_dict()
+        for grp, names in sorted(by_group.items(), key=lambda x: len(x[1]), reverse=True):
+            html += f"<b style='color:#0d6efd;'>{group_labels[grp]}</b> ({len(names)}):<br>" + "".join(f"&nbsp;&nbsp;✅ {n}<br>" for n in names) + "<br>"
+        return _chat_reply(_chat_html_card(f"🏆 الفائزون ({len(winners)} مقعد)", html), suggestions=["ملخص", "اقرب الخاسرين"], context=ctx)
+
+    # --- 8) summary ---
+    if has("ملخص", "summary", "توزيع", "احصائيات", "المقاعد"):
+        winners = df[df["IS_WINNER"] == True]
+        html = (f"👥 المرشحون: <b>{len(df)}</b><br>🗳️ مجموع الأصوات: <b>{total_votes:,}</b><br>"
+                f"💺 المقاعد: <b>{num_seats}</b><br>📋 اللوائح: <b>{len(groups_all)}</b><br>")
+        if num_seats > 0:
+            html += f"📐 الحاصل: <b>{int(total_votes / num_seats):,}</b><br>"
+        html += "<br><b style='color:#43a047;'>🏆 توزيع المقاعد:</b><br>"
+        if not winners.empty:
+            for grp, cnt in winners.groupby("GROUP")["MEMBER"].count().sort_values(ascending=False).items():
+                grp_total = int(df[df["GROUP"] == grp]["VOTES"].sum())
+                bar = int(cnt / max(1, num_seats) * 100)
+                html += (f"<div style='margin:3px 0;'><div style='display:flex;justify-content:space-between;font-size:0.78rem;'><span>{group_labels[grp]}</span>"
+                         f"<span><b>{int(cnt)}</b> مقعد • {grp_total:,} صوت</span></div><div style='background:#e0e3e8;border-radius:4px;height:6px;margin-top:2px;'>"
+                         f"<div style='background:linear-gradient(90deg,#667eea,#764ba2);width:{bar}%;height:100%;border-radius:4px;'></div></div></div>")
+        else:
+            html += "لم يتم حساب النتائج بعد."
+        return _chat_reply(_chat_html_card("📊 ملخص الدائرة", html), suggestions=["من فاز", "اقرب الخاسرين", "اعلى المرشحين"], context=ctx)
+
+    # --- 9) top candidates ---
+    if has("اعلى", "top", "ترتيب", "الاكثر", "اكثر"):
+        n = 10
+        nm = re.search(r"(\d+)", m_norm)
+        if nm:
+            n = max(1, min(30, int(nm.group(1))))
+        top_df = df.sort_values("VOTES", ascending=False).head(n)
+        mx = max(1, int(top_df.iloc[0]["VOTES"]))
+        html = ""
+        for i, (_, r) in enumerate(top_df.iterrows(), 1):
+            v = int(r["VOTES"])
+            html += (f"<div style='margin-bottom:4px;'><b>{i}.</b> {r['MEMBER']} {'🏆' if r['IS_WINNER'] else ''} — <b>{v:,}</b>"
+                     f" <span style='color:#6c757d;font-size:0.7rem;'>({group_labels[r['GROUP']]})</span>"
+                     f"<div style='background:#e0e3e8;border-radius:3px;height:4px;margin-top:1px;'><div style='background:linear-gradient(90deg,#667eea,#764ba2);"
+                     f"width:{int(v / mx * 100)}%;height:100%;border-radius:3px;'></div></div></div>")
+        return _chat_reply(_chat_html_card(f"🏅 أعلى {n} مرشحين", html), suggestions=["ملخص"], context=ctx)
+
+    # --- 10) list details ---
+    if has("لائحه", "قائمه", "list"):
+        text = strip_keywords(msg, ["لائحة", "لائحه", "قائمة", "list", "تفاصيل", "عن", "ما", "هي", "هل", "?", "؟"])
+        grp, amb = resolve_group(text)
+        if amb: return amb
+        if grp is not None:
+            return list_reply(grp)
+
+    # --- 11) candidate details (keywords, follow-ups, or a bare name) ---
+    text = strip_keywords(msg, ["أصوات", "اصوات", "صوت", "كم", "votes", "عن", "معلومات", "تفاصيل", "مرشح", "هل", "؟", "?"])
+    row, amb = resolve_candidate(text)
+    if amb: return amb
+    if row is not None:
+        remember_candidate(row)
+        return _chat_reply(candidate_card(row),
+                           suggestions=[f"بأي لائحة يفوز {row['MEMBER']}", f"لائحة {group_labels[row['GROUP']]}"], context=ctx)
+    g, amb = resolve_group(text, False)
+    if amb: return amb
+    if g is not None:
+        return _chat_reply(f"وجدت لائحة <b>{group_labels[g]}</b>.", suggestions=[f"لائحة {group_labels[g]}"], context=ctx)
+
+    return _chat_reply(_chat_help_html(prefix="لم أفهم سؤالك تماماً 🤔 — جرّب أحد هذه الأمثلة:"),
+                       suggestions=["ملخص", "من فاز", "اقرب الخاسرين", "اعلى المرشحين"], context=ctx)
+
 
 if __name__ == "__main__":
     app.config['TEMPLATES_AUTO_RELOAD'] = True 
