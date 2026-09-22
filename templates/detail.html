@@ -11,7 +11,8 @@
         body { background-color: #f0f2f5; font-family: 'Inter', 'Tajawal', system-ui, -apple-system, sans-serif; }
 
         .seat-badge { background-color: #0d6efd; color: white; padding: 4px 14px; border-radius: 50px; font-size: 0.9rem; margin-left: 12px; font-weight: 600; box-shadow: 0 2px 4px rgba(0,0,0,0.1); }
-        .chart-container { border: 1px solid #dee2e6; border-radius: 10px; padding: 12px; background: white; box-shadow: 0 2px 8px rgba(0,0,0,0.05); margin-bottom: 15px; display: flex; flex-direction: column; min-height: 280px; position: relative; }
+        .chart-scroll { height: 300px; overflow-y: auto; overflow-x: hidden; }
+        .chart-container { height: calc(100% - 15px); border: 1px solid #dee2e6; border-radius: 10px; padding: 12px; background: white; box-shadow: 0 2px 8px rgba(0,0,0,0.05); margin-bottom: 15px; display: flex; flex-direction: column; position: relative; }
         .chart-legend { position: absolute; top: 15px; right: 15px; display: flex; gap: 10px; font-size: 0.65rem; font-weight: bold; z-index: 10; background: rgba(255, 255, 255, 0.8); padding: 2px 5px; border-radius: 4px; }
         .legend-item { display: flex; align-items: center; gap: 4px; }
         .legend-box { width: 10px; height: 10px; border-radius: 2px; }
@@ -19,7 +20,7 @@
         .bg-loser { background-color: #adb5bd; }
         .district-label { font-size: 0.65rem; color: #6c757d; text-transform: uppercase; font-weight: bold; letter-spacing: 0.5px; }
         .religion-title { border-left: 4px solid #2e7d32; padding-left: 10px; margin-bottom: 8px; color: #212529; font-weight: 700; font-size: 0.95rem; }
-        .btn-seemore { font-size: 0.75rem; width: 100%; margin-top: 8px; font-weight: 600; padding: 4px; }
+        .btn-seemore { font-size: 0.75rem; width: 100%; margin-top: auto; font-weight: 600; padding: 4px; }
 
         .history-card { border: none; border-radius: 16px; overflow: hidden; position: sticky; top: 16px; display: flex; flex-direction: column; height: 88vh; max-height: 88vh; background: rgba(255,255,255,0.85); backdrop-filter: blur(20px); -webkit-backdrop-filter: blur(20px); box-shadow: 0 8px 32px rgba(0,0,0,0.12), 0 2px 8px rgba(0,0,0,0.06); border: 1px solid rgba(255,255,255,0.5); transition: all 0.3s cubic-bezier(0.4, 0, 0.2, 1); }
         .history-card:hover { box-shadow: 0 12px 40px rgba(0,0,0,0.15), 0 4px 12px rgba(0,0,0,0.08); }
@@ -137,6 +138,7 @@
         .autocomplete-item .ac-meta { font-size: 0.7rem; color: #6c757d; }
 
         /* Welcome card */
+        .cand-link { color: inherit; text-decoration: none; display:block; } .cand-link:hover { text-decoration: underline; }
         .welcome-card { background: linear-gradient(135deg, rgba(102,126,234,0.08), rgba(118,75,162,0.08)); border: 1px solid rgba(102,126,234,0.15); border-radius: 12px; padding: 14px; margin-bottom: 4px; }
         .welcome-card h6 { font-size: 0.88rem; font-weight: 700; color: #1a1a2e; margin-bottom: 8px; }
         .welcome-card .cmd-list { list-style: none; padding: 0; margin: 0; }
@@ -194,8 +196,10 @@
                     </div>
                     <div class="district-label">{{ district_name }}</div>
                     <div class="religion-title">{{ chart.title }}</div>
-                    <div id="{{ chart.id }}" style="min-height: 120px; width: 100%;">
-                        <div class="text-muted small text-center mt-4">⏳ Loading...</div>
+                    <div class="chart-scroll">
+                        <div id="{{ chart.id }}" style="width: 100%;">
+                            <div class="text-muted small text-center mt-4">⏳ Loading...</div>
+                        </div>
                     </div>
                 </div>
             </div>
@@ -297,7 +301,7 @@
                                             onclick="event.stopPropagation()"
                                             onchange="toggleCandidateSelection(this, '{{ c.name }}')">
                                         <div>
-                                            <div class="fw-bold">{{ c.name }}</div>
+                                            <a class="fw-bold cand-link" href="/candidate?file_id={{ file_id | urlencode }}&candidate_id={{ c.id | urlencode }}" onclick="event.stopPropagation()" title="Top 10 ballot pens">{{ c.name }}</a>
                                             <div class="small opacity-75" style="font-size: 0.7rem;">{{ c.religion }} . {{ c.district }}</div>
                                             {% if c.is_winner %}<span class="badge-winner">WINNER</span>{% endif %}
                                         </div>
@@ -437,7 +441,7 @@
                             <div class="profile-value" id="profileListPercent">-</div>
                         </div>
                         <div class="col-6">
-                            <div class="profile-label">% inside district</div>
+                            <div class="profile-label">% of seat votes</div>
                             <div class="profile-value" id="profileDistrictPercent">-</div>
                         </div>
                     </div>
@@ -498,7 +502,9 @@
         document.querySelectorAll('.candidate-card').forEach(c => {
             const v = safeNumber(c.dataset.votes);
             if ((c.dataset.group || '') === group) listTotal += v;
-            if ((c.dataset.district || '') === district) districtTotal += v;
+            // Same seat only: candidates competing for this district's religion/sect quota,
+            // not every candidate in the district across all sects.
+            if ((c.dataset.district || '') === district && (c.dataset.religion || '') === religion) districtTotal += v;
         });
 
         document.getElementById('profileName').textContent = name;
@@ -638,18 +644,10 @@
                     const el = document.getElementById(chartId);
                     if (el) {
                         el.innerHTML = ''; 
-                        Plotly.newPlot(el, initialPlot.data, initialPlot.layout, { responsive: true, displayModeBar: false });
-                        chartData[chartId] = { initial: initialPlot, full: fullPlot, state: 'initial' };
+                        Plotly.newPlot(el, fullPlot.data, fullPlot.layout, { responsive: true, displayModeBar: false });
+                        chartData[chartId] = { initial: fullPlot, full: fullPlot, state: 'initial' };
 
-                        {% if chart.has_more %}
-                            const container = document.getElementById('container-' + chartId);
-                            const btn = document.createElement('button');
-                            btn.id = 'btn-' + chartId;
-                            btn.className = 'btn btn-outline-primary btn-seemore';
-                            btn.innerText = 'See All';
-                            btn.onclick = () => toggleExpand(chartId);
-                            container.appendChild(btn);
-                        {% endif %}
+                        
                     }
                 })();
             {% endfor %}

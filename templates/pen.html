@@ -1,0 +1,86 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>{{ pen }} — Voters</title>
+    <link href="https://cdn.jsdelivr.net/npm/bootstrap@5.1.3/dist/css/bootstrap.min.css" rel="stylesheet">
+    <style>
+        body { background:#f4f6f9; }
+        .table-card { border:0; border-radius:16px; box-shadow:0 4px 16px rgba(0,0,0,0.07); overflow:hidden; }
+        .bar-wrap { background:#e9ecef; border-radius:4px; height:8px; min-width:120px; }
+        .bar-fill { background:linear-gradient(90deg,#667eea,#764ba2); height:100%; border-radius:4px; }
+    </style>
+</head>
+<body>
+{% macro page_url(n) -%}/pen?file_id={{ file_id | urlencode }}&pen={{ pen | urlencode }}&area={{ area | urlencode }}&candidate_id={{ candidate_id | urlencode }}&q={{ q | urlencode }}&sect={{ sect | urlencode }}&page={{ n }}{%- endmacro %}
+<div class="container py-4">
+    <div class="d-flex justify-content-between align-items-start flex-wrap gap-2 mb-4">
+        <div>
+            <h3 class="fw-bold mb-1">{{ pen }}</h3>
+            <div class="text-muted">{{ area }} · {{ year }} · {{ "{:,}".format(pen_total) }} candidate votes in this pen</div>
+        </div>
+        <a href="{% if area %}/area?file_id={{ file_id | urlencode }}&area={{ area | urlencode }}&candidate_id={{ candidate_id | urlencode }}{% elif slug %}/region/{{ slug }}?year={{ year }}{% else %}/{% endif %}" class="btn btn-outline-dark">← Back</a>
+    </div>
+
+    <div class="card table-card mb-4">
+        <div class="card-header bg-white fw-bold">Results by list in this pen</div>
+        <div class="table-responsive">
+            <table class="table align-middle mb-0">
+                <thead class="table-light"><tr><th>List</th><th class="text-end">Votes</th><th class="text-end">%</th><th>Weight</th></tr></thead>
+                <tbody>
+                    {% for l in lists %}
+                    <tr>
+                        <td class="fw-bold">{{ l.name }}</td>
+                        <td class="text-end">{{ "{:,}".format(l.votes) }}</td>
+                        <td class="text-end">{{ l.share }}%</td>
+                        <td><div class="bar-wrap"><div class="bar-fill" style="width: {{ (l.votes / lists[0].votes * 100) | round | int }}%;"></div></div></td>
+                    </tr>
+                    {% endfor %}
+                </tbody>
+            </table>
+        </div>
+    </div>
+
+    <div class="card table-card">
+        <div class="card-header bg-white d-flex justify-content-between align-items-center flex-wrap gap-2">
+            <span class="fw-bold">Registered voters — {{ area }} ({{ "{:,}".format(total_voters) }})</span>
+            <form class="d-flex gap-2" method="get" action="/pen">
+                <input type="hidden" name="file_id" value="{{ file_id }}">
+                <input type="hidden" name="pen" value="{{ pen }}">
+                <input type="hidden" name="area" value="{{ area }}">
+                <input type="hidden" name="candidate_id" value="{{ candidate_id }}">
+                <input name="q" value="{{ q }}" class="form-control form-control-sm" placeholder="Search name...">
+                <select name="sect" class="form-select form-select-sm" onchange="this.form.submit()">
+                    <option value="">All sects</option>
+                    {% for s in sects %}<option value="{{ s }}" {{ 'selected' if s == sect }}>{{ s }}</option>{% endfor %}
+                </select>
+                <button class="btn btn-sm btn-primary">Filter</button>
+            </form>
+        </div>
+        <div class="table-responsive">
+            <table class="table table-hover align-middle mb-0">
+                <thead class="table-light"><tr><th>Name</th><th>Family</th><th>Father</th><th>Mother</th><th>Born</th><th>Sect</th><th>Gender</th><th>Registry #</th></tr></thead>
+                <tbody>
+                    {% for v in voters %}
+                    <tr>
+                        <td>{{ v.first_name }}</td><td>{{ v.family_name }}</td><td>{{ v.father_name }}</td><td>{{ v.mother_name }}</td>
+                        <td>{{ v.birth_date }}</td><td>{{ v.personal_sect }}</td><td>{{ v.gender }}</td><td>{{ v.registry_number }}</td>
+                    </tr>
+                    {% else %}
+                    <tr><td colspan="8" class="text-muted">No registered voters matched this area name.</td></tr>
+                    {% endfor %}
+                </tbody>
+            </table>
+        </div>
+        {% if pages > 1 %}
+        <div class="card-footer bg-white d-flex justify-content-between align-items-center">
+            <a class="btn btn-sm btn-outline-secondary {{ 'disabled' if page <= 1 }}" href="{{ page_url(page - 1) }}">‹ Prev</a>
+            <span class="small text-muted">Page {{ page }} / {{ pages }}</span>
+            <a class="btn btn-sm btn-outline-secondary {{ 'disabled' if page >= pages }}" href="{{ page_url(page + 1) }}">Next ›</a>
+        </div>
+        {% endif %}
+    </div>
+</div>
+</body>
+</html>

@@ -16,6 +16,17 @@ import plotly.graph_objects as go
 import plotly.utils
 from itertools import combinations
 from arabic_utils import normalize_arabic
+import unicodedata
+
+
+def norm_place(value) -> str:
+    """Normalize a place name for matching voters_2026.town_norm against
+    election_pen_votes.neighborhood -- see migrations/import_voters_2026.py
+    (same logic, kept in sync) for why NFKC is needed on top of normalize_arabic."""
+    text_ = unicodedata.normalize("NFKC", str(value or ""))
+    text_ = normalize_arabic(text_)
+    text_ = re.sub(r"[ً-ْـ]", "", text_)
+    return re.sub(r"\s+", "", text_)
 
 app = Flask(__name__)
 
@@ -1522,6 +1533,204 @@ def compare_years(slug):
     if payload is None:
         return abort(404)
     return render_template("compare.html", **payload)
+
+@app.route("/candidate")
+def candidate_pens():
+    """Top ballot pens (أقلام الاقتراع) that voted for one candidate."""
+    file_id = request.args.get("file_id", "")
+    candidate_id = request.args.get("candidate_id", "")
+    year, district_code = parse_file_id(file_id)
+    df = get_candidates_df(file_id)
+    if df is None or year is None:
+        return "Data not found.", 404
+    match = df[df["CANDIDATE_ID"].astype(str) == candidate_id]
+    if match.empty:
+        return "Candidate not found.", 404
+    cand = match.iloc[0]
+
+    stmt = text("""
+        WITH totals AS (
+            SELECT ballot_pen, SUM(votes)::bigint AS pen_total
+            FROM election_pen_votes
+            WHERE year = :year AND district_code = :d
+            GROUP BY ballot_pen
+        )
+        SELECT v.ballot_pen, MAX(v.neighborhood) AS neighborhood, MAX(v.voting_place) AS voting_place,
+               SUM(v.votes)::bigint AS votes, MAX(t.pen_total) AS pen_total
+        FROM election_pen_votes v JOIN totals t USING (ballot_pen)
+        WHERE v.year = :year AND v.district_code = :d AND v.candidate_id = :cid
+        GROUP BY v.ballot_pen
+        ORDER BY votes DESC, v.ballot_pen
+    """)
+    try:
+        with DB_ENGINE.connect() as conn:
+            rows = conn.execute(stmt, {"year": year, "d": district_code, "cid": candidate_id}).mappings().all()
+    except Exception as exc:
+        print(f"Pen ranking failed: {exc}")
+        rows = []
+
+    pens_total_votes = sum(int(r["votes"]) for r in rows)
+    top = [{
+        "rank": i,
+        "pen": r["ballot_pen"],
+        "place": " - ".join(x for x in (r["neighborhood"], r["voting_place"]) if x and x != "nan"),
+        "votes": int(r["votes"]),
+        "share": round(int(r["votes"]) / max(1, int(r["pen_total"])) * 100, 1),
+        "of_candidate": round(int(r["votes"]) / max(1, pens_total_votes) * 100, 1),
+    } for i, r in enumerate(rows[:10], 1)]
+
+    areas_stmt = text("""
+        WITH totals AS (
+            SELECT neighborhood, SUM(votes)::bigint AS area_total
+            FROM election_pen_votes
+            WHERE year = :year AND district_code = :d
+            GROUP BY neighborhood
+        )
+        SELECT v.neighborhood, SUM(v.votes)::bigint AS votes, MAX(t.area_total) AS area_total,
+               COUNT(DISTINCT v.ballot_pen) AS pens
+        FROM election_pen_votes v JOIN totals t USING (neighborhood)
+        WHERE v.year = :year AND v.district_code = :d AND v.candidate_id = :cid
+          AND v.neighborhood IS NOT NULL AND v.neighborhood NOT IN ('', 'nan')
+        GROUP BY v.neighborhood
+        ORDER BY votes DESC, v.neighborhood
+    """)
+    try:
+        with DB_ENGINE.connect() as conn:
+            area_rows = conn.execute(areas_stmt, {"year": year, "d": district_code, "cid": candidate_id}).mappings().all()
+    except Exception as exc:
+        print(f"Area ranking failed: {exc}")
+        area_rows = []
+    cand_total = max(1, int(cand["VOTES"]))
+    areas = [{
+        "rank": i, "name": r["neighborhood"], "votes": int(r["votes"]), "pens": int(r["pens"]),
+        "share": round(int(r["votes"]) / max(1, int(r["area_total"])) * 100, 1),
+        "of_candidate": round(int(r["votes"]) / cand_total * 100, 1),
+    } for i, r in enumerate(area_rows[:10], 1)]
+
+    slug, region = get_region_by_file_id(file_id)
+    return render_template(
+        "candidate.html", areas=areas, candidate_id=candidate_id, year=year, slug=slug, file_id=file_id,
+        candidate={
+            "name": str(cand["MEMBER"]), "group": strip_list_number(cand["GROUP"]),
+            "religion": str(cand["RELIGION"]), "district": str(cand["DISTRICT"]),
+            "votes": int(cand["VOTES"]), "is_winner": bool(cand["IS_WINNER"]),
+        },
+        pens=top, pens_count=len(rows), pens_total_votes=pens_total_votes,
+    )
+
+def _pen_context(file_id):
+    year, district_code = parse_file_id(file_id)
+    if year is None:
+        return None, None, None
+    slug, _region = get_region_by_file_id(file_id)
+    return year, district_code, slug
+
+
+@app.route("/area")
+def area_lists():
+    """Lists (and ballot pens) for one city/area such as التبانة."""
+    file_id = request.args.get("file_id", "")
+    area = request.args.get("area", "")
+    candidate_id = request.args.get("candidate_id", "")
+    year, district_code, slug = _pen_context(file_id)
+    if year is None or not area:
+        return "Data not found.", 404
+    params = {"year": year, "d": district_code, "area": area}
+    lists_stmt = text("""
+        SELECT COALESCE(NULLIF(m.original_group_name, ''), m.group_name) AS grp,
+               SUM(v.votes)::bigint AS votes, COUNT(DISTINCT v.candidate_id) AS candidates
+        FROM election_pen_votes v
+        JOIN election_members m ON m.year = v.year AND m.district_code = v.district_code AND m.candidate_id = v.candidate_id
+        WHERE v.year = :year AND v.district_code = :d AND v.neighborhood = :area
+        GROUP BY grp ORDER BY votes DESC
+    """)
+    pens_stmt = text("""
+        SELECT ballot_pen, MAX(voting_place) AS place, SUM(votes)::bigint AS votes
+        FROM election_pen_votes
+        WHERE year = :year AND district_code = :d AND neighborhood = :area
+        GROUP BY ballot_pen ORDER BY votes DESC, ballot_pen
+    """)
+    with DB_ENGINE.connect() as conn:
+        list_rows = conn.execute(lists_stmt, params).mappings().all()
+        pen_rows = conn.execute(pens_stmt, params).mappings().all()
+    total = sum(int(r["votes"]) for r in list_rows)
+    lists = [{
+        "rank": i, "name": strip_list_number(r["grp"]), "votes": int(r["votes"]),
+        "candidates": int(r["candidates"]), "share": round(int(r["votes"]) / max(1, total) * 100, 1),
+    } for i, r in enumerate(list_rows, 1)]
+    pens = [{"pen": r["ballot_pen"], "place": r["place"] or "", "votes": int(r["votes"])} for r in pen_rows]
+    return render_template("area.html", year=year, slug=slug, file_id=file_id, area=area,
+                           candidate_id=candidate_id, lists=lists, pens=pens, total=total)
+
+
+@app.route("/pen")
+def pen_voters():
+    """One ballot pen: results by list, and the registered voters of its town."""
+    file_id = request.args.get("file_id", "")
+    pen = request.args.get("pen", "")
+    area = request.args.get("area", "")
+    candidate_id = request.args.get("candidate_id", "")
+    q = request.args.get("q", "").strip()
+    sect = request.args.get("sect", "").strip()
+    try:
+        page = max(1, int(request.args.get("page", "1")))
+    except ValueError:
+        page = 1
+    per_page = 50
+    year, district_code, slug = _pen_context(file_id)
+    if year is None or not pen:
+        return "Data not found.", 404
+
+    with DB_ENGINE.connect() as conn:
+        lists = conn.execute(text("""
+            SELECT COALESCE(NULLIF(m.original_group_name, ''), m.group_name) AS grp, SUM(v.votes)::bigint AS votes
+            FROM election_pen_votes v
+            JOIN election_members m ON m.year = v.year AND m.district_code = v.district_code AND m.candidate_id = v.candidate_id
+            WHERE v.year = :year AND v.district_code = :d AND v.ballot_pen = :pen
+            GROUP BY grp ORDER BY votes DESC
+        """), {"year": year, "d": district_code, "pen": pen}).mappings().all()
+        if not area:
+            row = conn.execute(text("""
+                SELECT MAX(neighborhood) AS n FROM election_pen_votes
+                WHERE year = :year AND district_code = :d AND ballot_pen = :pen
+            """), {"year": year, "d": district_code, "pen": pen}).mappings().first()
+            area = (row or {}).get("n") or ""
+
+        # election_pen_votes.neighborhood (2022 ballot export) and
+        # voters_2026.town (2026 registry) disagree on presentation-form
+        # ligatures/spacing, so match on the normalized column, not the raw text.
+        area_norm = norm_place(area)
+        where = "town_norm = :town_norm"
+        vparams = {"town_norm": area_norm}
+        if q:
+            where += " AND (first_name || ' ' || family_name || ' ' || father_name) ILIKE :q"
+            vparams["q"] = f"%{q}%"
+        if sect:
+            where += " AND personal_sect = :sect"
+            vparams["sect"] = sect
+        try:
+            total_voters = conn.execute(text(f"SELECT COUNT(*) FROM voters_2026 WHERE {where}"), vparams).scalar() or 0
+            voters = conn.execute(text(f"""
+                SELECT first_name, family_name, father_name, mother_name, birth_date, personal_sect, gender, registry_number
+                FROM voters_2026 WHERE {where}
+                ORDER BY family_name, first_name, id LIMIT :lim OFFSET :off
+            """), {**vparams, "lim": per_page, "off": (page - 1) * per_page}).mappings().all()
+            sects = [r[0] for r in conn.execute(text(
+                "SELECT DISTINCT personal_sect FROM voters_2026 WHERE town_norm = :town_norm ORDER BY 1"),
+                {"town_norm": area_norm}).all() if r[0]]
+        except Exception as exc:
+            print(f"Voter lookup failed: {exc}")
+            total_voters, voters, sects = 0, [], []
+
+    pen_total = sum(int(r["votes"]) for r in lists)
+    return render_template(
+        "pen.html", year=year, slug=slug, file_id=file_id, pen=pen, area=area, candidate_id=candidate_id,
+        lists=[{"name": strip_list_number(r["grp"]), "votes": int(r["votes"]),
+                "share": round(int(r["votes"]) / max(1, pen_total) * 100, 1)} for r in lists],
+        pen_total=pen_total, voters=voters, total_voters=int(total_voters), page=page,
+        pages=max(1, -(-int(total_voters) // per_page)), q=q, sect=sect, sects=sects,
+    )
+
 
 @app.route("/national")
 def national_dashboard():
