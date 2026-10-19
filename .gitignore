@@ -3,3 +3,6 @@ __pycache__/
 ~$*.xlsx
 .env
 venv/
+/private/
+/Ogero*.xlsx
+.pytest_cache/

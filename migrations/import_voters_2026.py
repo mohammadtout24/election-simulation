@@ -58,7 +58,7 @@ CREATE TABLE IF NOT EXISTS voters_2026 (
     first_name TEXT, family_name TEXT, father_name TEXT, mother_name TEXT,
     birth_date TEXT, personal_sect TEXT, registry_number TEXT, gender TEXT,
     registry_sect TEXT, town TEXT, town_norm TEXT, qada TEXT, governorate TEXT,
-    electoral_district TEXT, country TEXT
+    electoral_district TEXT, country TEXT, phone_number TEXT
 );
 """
 INDEXES = """
@@ -86,6 +86,7 @@ def main(dry_run: bool):
         with engine.begin() as conn:
             conn.execute(text(DDL))
             conn.execute(text("ALTER TABLE voters_2026 ADD COLUMN IF NOT EXISTS town_norm TEXT"))
+            conn.execute(text("ALTER TABLE voters_2026 ADD COLUMN IF NOT EXISTS phone_number TEXT"))
 
     files = sorted(f for f in os.listdir(SRC_DIR) if f.lower().endswith(".xlsx") and not f.startswith("~$"))
     total = 0
