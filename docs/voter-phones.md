@@ -19,10 +19,21 @@ import adds the phone column to an existing database if needed and applies all
 updates in one transaction. Repeating the import does not duplicate numbers.
 
 The workbook must contain `name` and `phone` columns. A name is matched against
-**first name + father's name + family name**, in that order. Arabic presentation
-forms, diacritics, keyboard variants and repeated spaces are normalized. Word
-boundaries are retained; partial names, reordered names and approximate matches
-are not used. Voters missing any of the three name fields are skipped.
+**first name + father's name + family name**, in that order. Matching first
+normalizes Arabic presentation forms, diacritics, invisible formatting marks,
+keyboard variants (`أ / إ / آ / ا`, `ى / ي`) and repeated spaces.
+
+If there is no exact normalized name, a second pass also ignores spaces in
+compound names (`عبدالله / عبد الله`, `ابوشرف / ابو شرف`) and accepts
+`ة / ه`, `ؤ / و`, and `ئ / ي` spelling differences. This fallback is allowed
+only when it identifies one voter across the entire registry, considering all
+spellings, towns and pages. Exact matches take priority. Partial names,
+reordered names and general typo guesses are not used. Voters missing any of
+the three name fields are skipped.
+
+The console reports exact names matched and Arabic spelling/spacing variants
+matched separately. These count source names; several spellings can belong to
+one matched voter, whose distinct numbers are combined without duplicates.
 
 The match must identify exactly one voter across the entire registry, including
 other towns and pages. Shared names are skipped because the workbook has no

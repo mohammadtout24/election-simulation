@@ -12,12 +12,19 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from arabic_utils import normalize_arabic  # noqa: E402
 from migrations.import_from_excel import DATABASE_URL  # noqa: E402
 
+_SPELLING_VARIANTS = str.maketrans({"ة": "ه", "ؤ": "و", "ئ": "ي"})
+
 
 def normalize_name(value):
     """Fold Arabic keyboard/rendering variants while retaining word boundaries."""
     name = normalize_arabic(unicodedata.normalize("NFKC", str(value or "")))
-    name = re.sub(r"[ً-ْـ\u0670\u200c-\u200f\u202a-\u202e\u2066-\u2069\ufeff]", "", name)
+    name = re.sub(r"[\u0610-\u061a\u064b-\u065fـ\u0670\u200b-\u200f\u202a-\u202e\u2066-\u2069\ufeff]", "", name)
     return " ".join(name.split()).casefold()
+
+
+def variant_name_key(value):
+    """Fallback key only: spelling/spacing variants need global uniqueness."""
+    return normalize_name(value).translate(_SPELLING_VARIANTS).replace(" ", "")
 
 
 def normalize_phone(value):
@@ -66,36 +73,52 @@ def load_phonebook(path):
 
 
 def match_voters(voters, phonebook):
-    # Track only names in the phonebook, even when the registry has millions
-    # of rows. A second voter with the same name makes that key ambiguous.
-    candidates = {}
-    stats = {"voters_scanned": 0, "matched_voters": 0}
+    # Keep exact and fallback candidates separately. Count fallback collisions
+    # across the entire registry, including voters with other exact spellings.
+    exact_candidates, variant_candidates = {}, {}
+    variant_keys = {variant_name_key(name) for name in phonebook}
+    stats = {"voters_scanned": 0, "exact_name_matches": 0,
+             "variant_name_matches": 0, "ambiguous_names": 0, "unmatched_names": 0}
     for voter in voters:
         stats["voters_scanned"] += 1
-        parts = [voter.get(c) for c in ("first_name", "father_name", "family_name")]
-        if not all(normalize_name(part) for part in parts):
+        parts = [normalize_name(voter.get(c)) for c in ("first_name", "father_name", "family_name")]
+        if not all(parts):
             continue
-        key = normalize_name(" ".join(parts))
+        key = " ".join(parts)
+        candidate = (voter["id"], voter.get("phone_number") or "")
         if key in phonebook:
-            candidates[key] = None if key in candidates else (
-                voter["id"], voter.get("phone_number") or ""
-            )
+            exact_candidates[key] = None if key in exact_candidates else candidate
+        variant = variant_name_key(key)
+        if variant in variant_keys:
+            variant_candidates[variant] = None if variant in variant_candidates else candidate
+
+    matched = {}
+    for key, phones in phonebook.items():
+        if key in exact_candidates:
+            candidate = exact_candidates[key]
+            match_type = "exact_name_matches"
+        else:
+            variant = variant_name_key(key)
+            if variant not in variant_candidates:
+                stats["unmatched_names"] += 1
+                continue
+            candidate = variant_candidates[variant]
+            match_type = "variant_name_matches"
+        if candidate is None:
+            stats["ambiguous_names"] += 1
+            continue
+        voter_id, existing = candidate
+        stats[match_type] += 1
+        if voter_id not in matched:
+            matched[voter_id] = (existing, {p.strip() for p in existing.split(",") if p.strip()})
+        matched[voter_id][1].update(phones)
 
     updates = []
-    for key, voter in candidates.items():
-        if voter is None:
-            continue
-        voter_id, existing = voter
-        stats["matched_voters"] += 1
-        numbers = {p.strip() for p in existing.split(",") if p.strip()} | phonebook[key]
+    for voter_id, (existing, numbers) in matched.items():
         value = ", ".join(sorted(numbers))
         if value != existing:
             updates.append({"voter_id": voter_id, "phone_number": value})
-    stats.update(
-        ambiguous_names=sum(v is None for v in candidates.values()),
-        unmatched_names=len(phonebook) - len(candidates),
-        updates=len(updates),
-    )
+    stats.update(matched_voters=len(matched), updates=len(updates))
     return updates, stats
 
 
@@ -137,6 +160,7 @@ def main():
         engine.dispose()
     print(f"Source rows: {source_stats['source_rows']:,}; invalid rows skipped: {source_stats['invalid_rows']:,}")
     print(f"Voters scanned: {stats['voters_scanned']:,}; unique full-name matches: {stats['matched_voters']:,}")
+    print(f"Exact names matched: {stats['exact_name_matches']:,}; Arabic spelling/spacing variants matched: {stats['variant_name_matches']:,}")
     print(f"Ambiguous names skipped: {stats['ambiguous_names']:,}; unmatched names: {stats['unmatched_names']:,}")
     action = "Would update" if args.dry_run else "Updated"
     print(f"{action} {stats['updates']:,} voters.")
