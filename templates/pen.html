@@ -60,15 +60,20 @@
         </div>
         <div class="table-responsive">
             <table class="table table-hover align-middle mb-0">
-                <thead class="table-light"><tr><th>Name</th><th>Family</th><th>Father</th><th>Mother</th><th>Born</th><th>Sect</th><th>Gender</th><th>Registry #</th></tr></thead>
+                <thead class="table-light"><tr><th>Name</th><th>Family</th><th>Father</th><th>Mother</th><th>Born</th><th>Sect</th><th>Gender</th><th>Registry #</th><th>Phone</th></tr></thead>
                 <tbody>
                     {% for v in voters %}
                     <tr>
                         <td>{{ v.first_name }}</td><td>{{ v.family_name }}</td><td>{{ v.father_name }}</td><td>{{ v.mother_name }}</td>
                         <td>{{ v.birth_date }}</td><td>{{ v.personal_sect }}</td><td>{{ v.gender }}</td><td>{{ v.registry_number }}</td>
+                        <td dir="ltr">
+                            {% if v.phone_number %}
+                                {% for phone in v.phone_number.split(', ') %}<div class="text-nowrap">{{ phone }}</div>{% endfor %}
+                            {% else %}<span class="text-muted">—</span>{% endif %}
+                        </td>
                     </tr>
                     {% else %}
-                    <tr><td colspan="8" class="text-muted">No registered voters matched this area name.</td></tr>
+                    <tr><td colspan="9" class="text-muted">No registered voters matched this area name.</td></tr>
                     {% endfor %}
                 </tbody>
             </table>

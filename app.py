@@ -2054,9 +2054,12 @@ def pen_voters():
             vparams["sect"] = sect
         try:
             total_voters = conn.execute(text(f"SELECT COUNT(*) FROM voters_2026 WHERE {where}"), vparams).scalar() or 0
+            # JSON extraction returns NULL before the phone migration is run,
+            # keeping existing voter tables readable during the upgrade.
             voters = conn.execute(text(f"""
-                SELECT first_name, family_name, father_name, mother_name, birth_date, personal_sect, gender, registry_number
-                FROM voters_2026 WHERE {where}
+                SELECT first_name, family_name, father_name, mother_name, birth_date, personal_sect, gender, registry_number,
+                       to_jsonb(v)->>'phone_number' AS phone_number
+                FROM voters_2026 v WHERE {where}
                 ORDER BY family_name, first_name, id LIMIT :lim OFFSET :off
             """), {**vparams, "lim": per_page, "off": (page - 1) * per_page}).mappings().all()
             sects = [r[0] for r in conn.execute(text(
