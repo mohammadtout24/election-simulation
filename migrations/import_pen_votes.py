@@ -53,6 +53,15 @@ def pen_rows(year: str, district: str, folder: str):
     for col in ("NEIGHBORHOOD", "VOTING PLACE"):
         raw[col] = _clean(raw[col]) if col in raw.columns else ""
 
+    # Some source rows (South3/2022) have the town and the polling-place name
+    # in each other's column. The pen name always starts with the town, so
+    # when it starts with VOTING PLACE and not with NEIGHBORHOOD, swap them.
+    swapped = [
+        bool(vp) and vp != "nan" and pen.startswith(vp) and not pen.startswith(nb)
+        for pen, nb, vp in zip(raw["BALLOT PEN"], raw["NEIGHBORHOOD"], raw["VOTING PLACE"])
+    ]
+    raw.loc[swapped, ["NEIGHBORHOOD", "VOTING PLACE"]] = raw.loc[swapped, ["VOTING PLACE", "NEIGHBORHOOD"]].values
+
     ids = data["votes"][["MEMBER", "GROUP", "candidate_id"]].drop_duplicates(["MEMBER", "GROUP"])
     merged = raw.merge(ids, on=["MEMBER", "GROUP"], how="left")
     merged = merged[merged["candidate_id"].notna() & (merged["VOTES"] > 0)]

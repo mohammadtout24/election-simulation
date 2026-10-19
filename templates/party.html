@@ -1,0 +1,136 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>{{ party }} — {{ year }}</title>
+    <link href="https://cdn.jsdelivr.net/npm/bootstrap@5.1.3/dist/css/bootstrap.min.css" rel="stylesheet">
+    <style>
+        body { background:#f4f6f9; }
+        .summary-card, .table-card { border:0; border-radius:16px; box-shadow:0 4px 16px rgba(0,0,0,0.07); overflow:hidden; }
+        .metric { font-size:1.6rem; font-weight:800; }
+        .rank-badge { display:inline-flex; align-items:center; justify-content:center; width:28px; height:28px; border-radius:50%; background:#eef2ff; color:#0d6efd; font-weight:700; font-size:0.8rem; }
+        .rank-1 { background:#ffd54f; color:#5d4200; } .rank-2 { background:#cfd8dc; color:#37474f; } .rank-3 { background:#ffccbc; color:#6d2c14; }
+        .bar-wrap { background:#e9ecef; border-radius:4px; height:8px; min-width:110px; }
+        .bar-fill { background:linear-gradient(90deg,#7e57c2,#5e35b1); height:100%; border-radius:4px; }
+        a.plain { text-decoration:none; }
+        a.plain:hover { text-decoration:underline; }
+    </style>
+</head>
+<body>
+<div class="container py-4">
+    <div class="d-flex justify-content-between align-items-start flex-wrap gap-2 mb-4">
+        <div>
+            <h3 class="fw-bold mb-1" style="color:#5e35b1;">{{ party }}</h3>
+            <div class="text-muted">Political party · {{ year }} election · where its candidates got their votes</div>
+        </div>
+        <div class="d-flex gap-2">
+            <a href="/parties?year={{ year }}" class="btn btn-outline-primary fw-bold">All parties</a>
+            <a href="javascript:history.back()" class="btn btn-outline-dark">← Back</a>
+        </div>
+    </div>
+
+    <div class="row g-3 mb-4 text-center">
+        <div class="col-6 col-md-3"><div class="card summary-card p-3"><div class="metric">{{ "{:,}".format(total_votes) }}</div><div class="text-muted small">Total votes</div></div></div>
+        <div class="col-6 col-md-3"><div class="card summary-card p-3"><div class="metric">{{ seats }}</div><div class="text-muted small">Seats won</div></div></div>
+        <div class="col-6 col-md-3"><div class="card summary-card p-3"><div class="metric">{{ candidates|length }}</div><div class="text-muted small">Candidates</div></div></div>
+        <div class="col-6 col-md-3"><div class="card summary-card p-3"><div class="metric">{{ districts|length }}</div><div class="text-muted small">Districts contested</div></div></div>
+    </div>
+
+    <div class="card table-card mb-4">
+        <div class="card-header bg-white fw-bold">Top districts for this party</div>
+        <div class="table-responsive">
+            <table class="table table-hover align-middle mb-0">
+                <thead class="table-light"><tr><th>#</th><th>District</th><th class="text-end">Votes</th><th class="text-end">% of district</th><th class="text-end">% of party's votes</th><th class="text-end">Candidates</th><th class="text-end">Seats</th><th>Weight</th></tr></thead>
+                <tbody>
+                    {% for d in districts %}
+                    <tr>
+                        <td><span class="rank-badge {% if loop.index <= 3 %}rank-{{ loop.index }}{% endif %}">{{ loop.index }}</span></td>
+                        <td class="fw-bold">{% if d.slug %}<a class="plain" href="/region/{{ d.slug }}?year={{ year }}">{{ d.label }}</a>{% else %}{{ d.label }}{% endif %}</td>
+                        <td class="text-end fw-bold">{{ "{:,}".format(d.votes) }}</td>
+                        <td class="text-end">{{ d.share }}%</td>
+                        <td class="text-end">{{ d.of_party }}%</td>
+                        <td class="text-end">{{ d.candidates }}</td>
+                        <td class="text-end">{{ d.seats }}</td>
+                        <td><div class="bar-wrap"><div class="bar-fill" style="width: {{ (d.votes / districts[0].votes * 100) | round | int if districts[0].votes else 0 }}%;"></div></div></td>
+                    </tr>
+                    {% endfor %}
+                </tbody>
+            </table>
+        </div>
+    </div>
+
+    <div class="card table-card mb-4">
+        <div class="card-header bg-white fw-bold">Top {{ top_n }} cities / areas (المدن والأحياء)</div>
+        {% if areas %}
+        <div class="table-responsive">
+            <table class="table table-hover align-middle mb-0">
+                <thead class="table-light"><tr><th>#</th><th>City / area</th><th>District</th><th class="text-end">Votes</th><th class="text-end">% of area</th><th class="text-end">Pens</th><th>Weight</th></tr></thead>
+                <tbody>
+                    {% for a in areas %}
+                    <tr>
+                        <td><span class="rank-badge {% if loop.index <= 3 %}rank-{{ loop.index }}{% endif %}">{{ loop.index }}</span></td>
+                        <td class="fw-bold"><a class="plain" href="/area?file_id={{ a.file_id | urlencode }}&area={{ a.name | urlencode }}">{{ a.name }}</a></td>
+                        <td class="text-muted">{{ a.district }}</td>
+                        <td class="text-end fw-bold">{{ "{:,}".format(a.votes) }}</td>
+                        <td class="text-end">{{ a.share }}%</td>
+                        <td class="text-end">{{ a.pens }}</td>
+                        <td><div class="bar-wrap"><div class="bar-fill" style="width: {{ (a.votes / areas[0].votes * 100) | round | int }}%;"></div></div></td>
+                    </tr>
+                    {% endfor %}
+                </tbody>
+            </table>
+        </div>
+        {% else %}<div class="card-body text-muted">No city/area data for this party.</div>{% endif %}
+    </div>
+
+    <div class="card table-card mb-4">
+        <div class="card-header bg-white fw-bold">Top {{ top_n }} ballot pens (أقلام الاقتراع)</div>
+        {% if pens %}
+        <div class="table-responsive">
+            <table class="table table-hover align-middle mb-0">
+                <thead class="table-light"><tr><th>#</th><th>Ballot pen</th><th>District</th><th class="text-end">Votes</th><th class="text-end">% of pen</th><th>Weight</th></tr></thead>
+                <tbody>
+                    {% for p in pens %}
+                    <tr>
+                        <td><span class="rank-badge {% if loop.index <= 3 %}rank-{{ loop.index }}{% endif %}">{{ loop.index }}</span></td>
+                        <td>
+                            <a class="plain fw-bold" href="/pen?file_id={{ p.file_id | urlencode }}&pen={{ p.name | urlencode }}&area={{ p.area | urlencode }}">{{ p.name }}</a>
+                            {% if p.area %}<div class="small text-muted">{{ p.area }}</div>{% endif %}
+                        </td>
+                        <td class="text-muted">{{ p.district }}</td>
+                        <td class="text-end fw-bold">{{ "{:,}".format(p.votes) }}</td>
+                        <td class="text-end">{{ p.share }}%</td>
+                        <td><div class="bar-wrap"><div class="bar-fill" style="width: {{ (p.votes / pens[0].votes * 100) | round | int }}%;"></div></div></td>
+                    </tr>
+                    {% endfor %}
+                </tbody>
+            </table>
+        </div>
+        {% else %}<div class="card-body text-muted">No ballot-pen data for this party.</div>{% endif %}
+    </div>
+
+    <div class="card table-card mb-4">
+        <div class="card-header bg-white fw-bold">Candidates of this party ({{ candidates|length }})</div>
+        <div class="table-responsive">
+            <table class="table table-hover align-middle mb-0">
+                <thead class="table-light"><tr><th>Candidate</th><th>District</th><th>Seat</th><th>List</th><th class="text-end">Votes</th><th>Result</th></tr></thead>
+                <tbody>
+                    {% for c in candidates %}
+                    <tr class="{{ 'table-success' if c.is_winner }}">
+                        <td class="fw-bold"><a class="plain" href="/candidate?file_id={{ c.file_id | urlencode }}&candidate_id={{ c.id | urlencode }}">{{ c.name }}</a></td>
+                        <td>{{ c.district }}</td>
+                        <td class="text-muted">{{ c.sect }} · {{ c.qada }}</td>
+                        <td>{{ c.list }}</td>
+                        <td class="text-end fw-bold">{{ "{:,}".format(c.votes) }}</td>
+                        <td>{{ 'Winner' if c.is_winner else 'Not elected' }}</td>
+                    </tr>
+                    {% endfor %}
+                </tbody>
+            </table>
+        </div>
+    </div>
+    <div class="text-muted small mb-4">“% of district / area / pen” is the party's share of all candidate votes cast there. City and pen figures come from the ballot-pen records.</div>
+</div>
+</body>
+</html>

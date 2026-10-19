@@ -21,6 +21,7 @@
         <div>
             <h3 class="fw-bold mb-1">{{ candidate.name }}
                 {% if candidate.is_winner %}<span class="badge bg-success align-middle fs-6">Winner</span>{% endif %}</h3>
+            {% if candidate.party %}<a class="fw-bold text-decoration-none" style="color:#5e35b1;" href="/party?year={{ year }}&name={{ candidate.party | urlencode }}">{{ candidate.party }}</a>{% endif %}
             <div class="text-muted">{{ candidate.group }} · {{ candidate.religion }} · {{ candidate.district }} · {{ year }}</div>
         </div>
         <a href="{{ '/region/' ~ slug ~ '?year=' ~ year if slug else '/' }}" class="btn btn-outline-dark">← Back</a>

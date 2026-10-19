@@ -40,6 +40,8 @@
 
         .candidate-card { cursor: grab; padding: 8px 12px; font-size: 0.85rem; margin-bottom: 5px; border-radius: 6px; background: white; border: 1px solid #dee2e6; box-shadow: 0 1px 3px rgba(0,0,0,0.04); transition: transform 0.1s ease; }
         .candidate-card.winner-card { background-color: #e8f5e9; border-left: 4px solid #2e7d32; color: #1b5e20; }
+        @keyframes justMoved { 0%, 60% { box-shadow: 0 0 0 3px #ff9800; background-color: #fff3e0; } 100% { box-shadow: 0 0 0 0 rgba(255,152,0,0); } }
+        .candidate-card.just-moved { animation: justMoved 4s ease-out 1; }
         .candidate-card.loser-card { background-color: #ffffff; border-left: 4px solid #ced4da; }
         .badge-winner { background-color: #2e7d32; color: white; font-size: 0.6rem; padding: 1px 5px; border-radius: 3px; font-weight: bold; margin-top: 4px; display: inline-block; }
         .list-header { background: #0d6efd; color: white; padding: 8px 12px; font-size: 0.9rem; font-weight: bold; border-radius: 6px 6px 0 0; }
@@ -139,6 +141,8 @@
 
         /* Welcome card */
         .cand-link { color: inherit; text-decoration: none; display:block; } .cand-link:hover { text-decoration: underline; }
+        .cand-party { display: block; font-size: 0.7rem; font-weight: 600; color: #5e35b1; text-decoration: none; }
+        .cand-party:hover { text-decoration: underline; color: #5e35b1; }
         .welcome-card { background: linear-gradient(135deg, rgba(102,126,234,0.08), rgba(118,75,162,0.08)); border: 1px solid rgba(102,126,234,0.15); border-radius: 12px; padding: 14px; margin-bottom: 4px; }
         .welcome-card h6 { font-size: 0.88rem; font-weight: 700; color: #1a1a2e; margin-bottom: 8px; }
         .welcome-card .cmd-list { list-style: none; padding: 0; margin: 0; }
@@ -293,7 +297,7 @@
                         </div>
                         <div class="sortable-list" id="list-{{ safe_id }}" data-group="{{ group_name }}">
                             {% for c in candidates %}
-                            <div class="candidate-card {{ 'winner-card' if c.is_winner else 'loser-card' }}" onclick="openCandidateProfile(this)" data-name="{{ c.name }}" data-candidate-id="{{ c.id }}" data-votes="{{ c.votes }}" data-religion="{{ c.religion }}" data-district="{{ c.district }}" data-group="{{ group_name }}" data-winner="{{ 'true' if c.is_winner else 'false' }}">
+                            <div class="candidate-card {{ 'winner-card' if c.is_winner else 'loser-card' }}" onclick="openCandidateProfile(this)" data-name="{{ c.name }}" data-candidate-id="{{ c.id }}" data-votes="{{ c.votes }}" data-religion="{{ c.religion }}" data-district="{{ c.district }}" data-group="{{ group_name }}" data-party="{{ c.party }}" data-winner="{{ 'true' if c.is_winner else 'false' }}">
                                 <div class="d-flex justify-content-between align-items-center">
                                     <div class="text-truncate d-flex align-items-start gap-2">
                                         <input type="checkbox" class="sel-checkbox mt-1"
@@ -302,6 +306,7 @@
                                             onchange="toggleCandidateSelection(this, '{{ c.name }}')">
                                         <div>
                                             <a class="fw-bold cand-link" href="/candidate?file_id={{ file_id | urlencode }}&candidate_id={{ c.id | urlencode }}" onclick="event.stopPropagation()" title="Top 10 ballot pens">{{ c.name }}</a>
+                                            {% if c.party %}<a class="cand-party" href="/party?year={{ current_year }}&name={{ c.party | urlencode }}" onclick="event.stopPropagation()" title="Open party page">{{ c.party }}</a>{% endif %}
                                             <div class="small opacity-75" style="font-size: 0.7rem;">{{ c.religion }} . {{ c.district }}</div>
                                             {% if c.is_winner %}<span class="badge-winner">WINNER</span>{% endif %}
                                         </div>
@@ -410,6 +415,10 @@
                     <div class="profile-label">List</div>
                     <div class="profile-value" id="profileGroup">-</div>
                 </div>
+                <div class="profile-row" id="profilePartyRow" style="display:none;">
+                    <div class="profile-label">Political party</div>
+                    <div class="profile-value"><a id="profileParty" href="#" style="color:#5e35b1;">-</a></div>
+                </div>
                 <div class="profile-row">
                     <div class="row">
                         <div class="col-6">
@@ -512,6 +521,10 @@
         document.getElementById('profileGroup').textContent = group;
         document.getElementById('profileDistrict').textContent = district;
         document.getElementById('profileReligion').textContent = religion;
+        const party = card.dataset.party || '';
+        document.getElementById('profileParty').textContent = party;
+        document.getElementById('profileParty').href = '/party?year={{ current_year }}&name=' + encodeURIComponent(party);
+        document.getElementById('profilePartyRow').style.display = party ? '' : 'none';
         document.getElementById('profileVotes').textContent = votes.toLocaleString();
         document.getElementById('profileListPercent').textContent = formatPercent(votes, listTotal);
         document.getElementById('profileDistrictPercent').textContent = formatPercent(votes, districtTotal);
@@ -751,6 +764,157 @@
         }
     }
 
+    // --- LIVE RESULT UPDATES (winner badges, seat changes, reload that keeps your place) ---
+    let lastWinners = new Set();
+    let lastSeats = {};
+
+    function listLabel(g) {
+        return String(g).replace(/^\(\s*\d+\s*\)\s*|\s*\(\s*\d+\s*\)\s*$/g, '').trim();
+    }
+
+    function currentWinnerIds() {
+        return new Set([...document.querySelectorAll('.candidate-card.winner-card')].map(c => c.dataset.candidateId));
+    }
+
+    function seatsByList() {
+        const seats = {};
+        document.querySelectorAll('.sortable-list').forEach(l => {
+            seats[l.dataset.group] = l.querySelectorAll('.candidate-card.winner-card').length;
+        });
+        return seats;
+    }
+
+    // Repaint winner badges and chart bars from the server's winner ids.
+    function applyWinnerIds(ids) {
+        const winners = new Set(ids || []);
+        const winnerNames = new Set();
+        document.querySelectorAll('.candidate-card').forEach(card => {
+            const win = winners.has(card.dataset.candidateId);
+            card.classList.toggle('winner-card', win);
+            card.classList.toggle('loser-card', !win);
+            card.dataset.winner = win ? 'true' : 'false';
+            let badge = card.querySelector('.badge-winner');
+            if (win && !badge) {
+                badge = document.createElement('span');
+                badge.className = 'badge-winner';
+                badge.textContent = 'WINNER';
+                const link = card.querySelector('.cand-link');
+                if (link) link.parentElement.appendChild(badge);
+            } else if (!win && badge) {
+                badge.remove();
+            }
+            if (win) winnerNames.add(card.dataset.name);
+        });
+        const colorsFor = plot => plot.data[0].y.map(n => winnerNames.has(n) ? '#1b5e20' : '#cfd8dc');
+        Object.keys(chartData).forEach(id => {
+            const el = document.getElementById(id);
+            const cd = chartData[id];
+            if (!el || !el.data || !cd) return;
+            cd.initial.data[0].marker.color = colorsFor(cd.initial);
+            cd.full.data[0].marker.color = colorsFor(cd.full);
+            Plotly.restyle(el, { 'marker.color': [colorsFor(el)] });
+        });
+    }
+
+    // Compare two result states and describe what changed (people and seats per list).
+    function describeChanges(prevWinners, prevSeats, nowWinners, nowSeats) {
+        const infoById = {};
+        document.querySelectorAll('.candidate-card').forEach(c => {
+            const list = c.closest('.sortable-list');
+            infoById[c.dataset.candidateId] = {
+                name: c.dataset.name,
+                list: list ? listLabel(list.dataset.group) : '',
+                seat: `${c.dataset.religion} • ${c.dataset.district}`,
+            };
+        });
+        const person = id => {
+            const i = infoById[id];
+            return i ? `<b>${i.name}</b> <span style="color:#6c757d;font-size:0.72rem;">(${i.list} — ${i.seat})</span>` : `<b>${id}</b>`;
+        };
+        const won = [...nowWinners].filter(id => !prevWinners.has(id));
+        const lost = [...prevWinners].filter(id => !nowWinners.has(id));
+        const seatLines = [];
+        new Set([...Object.keys(prevSeats), ...Object.keys(nowSeats)]).forEach(g => {
+            const a = prevSeats[g] || 0, b = nowSeats[g] || 0;
+            if (a !== b) seatLines.push(`<span style="color:${b > a ? '#1b5e20' : '#b71c1c'};">${b > a ? '⬆️' : '⬇️'} <b>${listLabel(g)}</b>: من ${a} إلى ${b} مقعد</span>`);
+        });
+        if (!won.length && !lost.length && !seatLines.length) return '';
+        let html = `<strong>📊 تغييرات النتائج</strong><hr style="margin:6px 0; border-color:#ccc;">`;
+        html += `<b style="color:#1b5e20;">🏆 الفائزون الجدد (${won.length}):</b><br>`;
+        html += won.length ? won.map(id => `✅ ${person(id)}`).join('<br>') + '<br>' : `<span style="color:#6c757d;">لا أحد</span><br>`;
+        html += `<b style="color:#b71c1c;">❌ الخاسرون الجدد (${lost.length}):</b><br>`;
+        html += lost.length ? lost.map(id => `🔻 ${person(id)}`).join('<br>') + '<br>' : `<span style="color:#6c757d;">لا أحد</span><br>`;
+        if (seatLines.length) html += `<b>💺 المقاعد:</b><br>` + seatLines.join('<br>') + '<br>';
+        if (!won.length && !lost.length) html += `<span style="color:#6c757d;font-size:0.75rem;">الفائزون أنفسهم، لكن مقعداً انتقل مع مرشح بين اللائحتين.</span>`;
+        return html;
+    }
+
+    function seatSummaryHtml() {
+        const seats = seatsByList();
+        const rows = Object.keys(seats).filter(g => seats[g] > 0).sort((a, b) => seats[b] - seats[a])
+            .map(g => `<b>${listLabel(g)}</b>: ${seats[g]}`);
+        return rows.length ? `<br><span style="font-size:0.78rem;">${rows.join(' • ')}</span>` : '';
+    }
+
+    // Apply new winners now and return a description of what changed since the last known state.
+    function updateResultsLive(winnerIds) {
+        const prevWinners = lastWinners, prevSeats = lastSeats;
+        applyWinnerIds(winnerIds);
+        lastWinners = currentWinnerIds();
+        lastSeats = seatsByList();
+        return describeChanges(prevWinners, prevSeats, lastWinners, lastSeats);
+    }
+
+    function flashCards(ids) {
+        (ids || []).forEach(id => {
+            const card = [...document.querySelectorAll('.candidate-card')].find(c => c.dataset.candidateId === id);
+            if (!card) return;
+            const list = card.closest('.sortable-list');
+            if (list) list.scrollTop = Math.max(0, card.offsetTop - list.offsetTop - 8);
+            card.classList.remove('just-moved');
+            void card.offsetWidth;
+            card.classList.add('just-moved');
+        });
+    }
+
+    function rememberMoved(ids) {
+        let all = [];
+        try { all = JSON.parse(sessionStorage.getItem('movedIds') || '[]'); } catch (e) {}
+        ids.forEach(id => { if (id && !all.includes(id)) all.push(id); });
+        sessionStorage.setItem('movedIds', JSON.stringify(all));
+        flashCards(ids);
+    }
+
+    // Reload so lists and charts are rebuilt, but keep the scroll position and
+    // (optionally) report after the reload what changed compared with before it.
+    function reloadKeepingPlace(compareAfterReload) {
+        sessionStorage.setItem('keepScrollY', String(window.scrollY));
+        if (compareAfterReload) {
+            sessionStorage.setItem('pendingCompare', JSON.stringify({ winners: [...lastWinners], seats: lastSeats }));
+        }
+        window.location.reload();
+    }
+
+    window.addEventListener('DOMContentLoaded', function () {
+        lastWinners = currentWinnerIds();
+        lastSeats = seatsByList();
+        const y = sessionStorage.getItem('keepScrollY');
+        if (y !== null) { sessionStorage.removeItem('keepScrollY'); window.scrollTo(0, parseFloat(y) || 0); }
+        const pending = sessionStorage.getItem('pendingCompare');
+        if (pending) {
+            sessionStorage.removeItem('pendingCompare');
+            try {
+                const prev = JSON.parse(pending);
+                const html = describeChanges(new Set(prev.winners || []), prev.seats || {}, lastWinners, lastSeats);
+                if (html) addLogMessage(html, 'log-info');
+            } catch (e) {}
+        }
+        let moved = [];
+        try { moved = JSON.parse(sessionStorage.getItem('movedIds') || '[]'); } catch (e) {}
+        sessionStorage.removeItem('movedIds');
+        if (moved.length) setTimeout(() => flashCards(moved), 150);
+    });
+
     // --- DRAG AND DROP / SWAP LOGIC ---
     function refreshCandidatePercents() {
         document.querySelectorAll('.sortable-list').forEach(list => {
@@ -799,6 +963,9 @@
                         document.getElementById('total-' + data.target_group_id).innerText = data.target_total.toLocaleString();
                     }
                     currentVotesNeeded = {}; refreshCandidatePercents();
+                    rememberMoved([candidateId, targetId]);
+                    const changes = updateResultsLive(data.winner_ids);
+                    if (changes) addLogMessage(changes, 'log-info');
                 } else {
                     // Revert the DOM swap: put each card back in its original list
                     evt.from.insertBefore(evt.item, evt.from.children[evt.oldIndex] || null);
@@ -824,8 +991,8 @@
 
                 if (data.success) {
                     addLogMessage(`<strong>🔄 نقل:</strong> تم نقل <b>${data.candidate}</b> إلى <b>${data.new_group}</b>.`, 'log-success');
-                    const oldSafeId = data.old_group.replace(/[\s\.]/g, '_');
-                    const newSafeId = data.new_group.replace(/[\s\.]/g, '_');
+                    const oldSafeId = data.old_group.replace(/ /g, '_').replace(/\./g, '');
+                    const newSafeId = data.new_group.replace(/ /g, '_').replace(/\./g, '');
                     if (document.getElementById('total-' + oldSafeId)) {
                         document.getElementById('total-' + oldSafeId).innerText = data.old_total.toLocaleString();
                     }
@@ -833,6 +1000,9 @@
                         document.getElementById('total-' + newSafeId).innerText = data.new_total.toLocaleString();
                     }
                     currentVotesNeeded = {}; refreshCandidatePercents();
+                    rememberMoved([candidateId]);
+                    const changes = updateResultsLive(data.winner_ids);
+                    if (changes) addLogMessage(changes, 'log-info');
                 } else {
                     addLogMessage(`<strong>❌ خطأ:</strong> ${data.message}`, 'log-error');
                 }
@@ -936,7 +1106,7 @@
             if (data.success) {
                 currentVotesNeeded = {}; refreshCandidatePercents();
                 addLogMessage(`<strong>🔄 Multi-swap:</strong> تم تنفيذ ${swaps.length} تبديلات بنجاح.`, 'log-success');
-                recalcResults();
+                reloadKeepingPlace(true);
             }
         } catch (e) { }
     }
@@ -1108,7 +1278,7 @@
             appendMessage(data.reply, "bot");
             renderChatSuggestions(data.suggestions);
             if (data.action === 'swap_done') {
-                setTimeout(() => window.location.reload(), 1500);
+                setTimeout(() => reloadKeepingPlace(true), 1500);
             }
         } catch (e) {
             document.getElementById(typingId)?.remove();
@@ -1216,32 +1386,14 @@
             });
             const data = await res.json();
             if (data.success) {
-                const newWinners = new Set(data.winner_names || []);
-
-                // Get previous winners from DOM (cards with winner-card class)
-                const oldWinners = new Set();
-                document.querySelectorAll('.candidate-card.winner-card').forEach(card => {
-                    oldWinners.add(card.dataset.name);
-                });
-
-                // Find changes only
-                const newlyWon = [...newWinners].filter(n => !oldWinners.has(n));
-                const newlyLost = [...oldWinners].filter(n => !newWinners.has(n));
-
-                if (newlyWon.length === 0 && newlyLost.length === 0) {
-                    addLogMessage(`<strong>📊 إعادة الحساب:</strong> لا تغييرات — النتائج كما هي.`, 'log-info');
+                const changes = updateResultsLive(data.winner_ids);
+                if (changes) {
+                    addLogMessage(changes, 'log-info');
                 } else {
-                    let html = `<strong>📊 تغييرات النتائج</strong><hr style="margin:6px 0; border-color:#ccc;">`;
-                    newlyWon.forEach(n => {
-                        html += `<span style="color:#1b5e20;">🆕✅ <b>${n}</b> — فاز</span><br>`;
-                    });
-                    newlyLost.forEach(n => {
-                        html += `<span style="color:#b71c1c;">🔻❌ <b>${n}</b> — خسر</span><br>`;
-                    });
-                    addLogMessage(html, 'log-info');
+                    addLogMessage(`<strong>📊 إعادة الحساب:</strong> النتائج محدَّثة — توزيع المقاعد الحالي:` + seatSummaryHtml(), 'log-info');
                 }
 
-                setTimeout(() => window.location.reload(), 100);
+                setTimeout(() => reloadKeepingPlace(false), 100);
             }
         } catch (e) {
             btn.disabled = false;

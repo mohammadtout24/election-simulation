@@ -230,6 +230,13 @@ def get_list_only_votes(file_id: str) -> dict:
     return result
 
 
+def _list_key(name) -> str:
+    """Canonical key for comparing list names across source files."""
+    text_ = normalize_arabic(str(name or ""))
+    text_ = re.sub("[ً-ْـ]", "", text_)
+    return re.sub(r"[\s\d()]+", "", text_)
+
+
 def group_vote_totals(file_id: str, df: pd.DataFrame) -> pd.DataFrame:
     """Per-list (GROUP) vote totals, including list-only ballots -- the
     single source of truth every seat-quota calculation should sum from,
@@ -240,15 +247,28 @@ def group_vote_totals(file_id: str, df: pd.DataFrame) -> pd.DataFrame:
     if not list_only:
         return df_group
 
+    # The raw export sometimes files a list's list-only ballots under a
+    # slightly different spelling of its name (a leading list number, an
+    # extra space, a hamza/madda variant). Match on a canonical key so those
+    # ballots are added to the real list instead of forming a phantom list.
+    key_to_group = {}
+    for g in df_group["GROUP"].astype(str):
+        key_to_group.setdefault(_list_key(g), g)
+    extra_votes, unmatched = {}, {}
+    for name, votes in list_only.items():
+        target = name if name in set(df_group["GROUP"].astype(str)) else key_to_group.get(_list_key(name))
+        if target is not None:
+            extra_votes[target] = extra_votes.get(target, 0) + votes
+        else:
+            unmatched[name] = unmatched.get(name, 0) + votes
+
     df_group["VOTES"] = df_group.apply(
-        lambda row: row["VOTES"] + list_only.get(str(row["GROUP"]), 0), axis=1
+        lambda row: row["VOTES"] + extra_votes.get(str(row["GROUP"]), 0), axis=1
     )
-    # A list can have list-only ballots but zero individual candidates (or
-    # zero candidates who received any preferential votes), in which case it
-    # never appears in df_group at all; add it so its votes still count.
-    missing_groups = set(list_only) - set(df_group["GROUP"].astype(str))
-    if missing_groups:
-        extra = pd.DataFrame([{"GROUP": g, "VOTES": list_only[g]} for g in missing_groups])
+    # A list can have list-only ballots but no candidate in the current
+    # scenario; keep it so its votes still count toward the quotient.
+    if unmatched:
+        extra = pd.DataFrame([{"GROUP": g, "VOTES": v} for g, v in unmatched.items()])
         df_group = pd.concat([df_group, extra], ignore_index=True)
     return df_group
 
@@ -848,7 +868,7 @@ def _compute_winners_from_quota(file_id: str, df: pd.DataFrame) -> set:
 
     df_group_adjusted = df_group[df_group["USED"] == 1].copy()
     df_group_adjusted["QUOTIENT"] = df_group_adjusted["VOTES"] / electoral_quotient_adjusted
-    df_group_adjusted["INITIAL_SEATS"] = df_group_adjusted["QUOTIENT"].apply(lambda x: math.floor(round(x, 3)))
+    df_group_adjusted["INITIAL_SEATS"] = df_group_adjusted["QUOTIENT"].apply(lambda x: math.floor(round(x, 9)))
     df_group_adjusted["ADVANTAGE"] = df_group_adjusted["QUOTIENT"] - df_group_adjusted["INITIAL_SEATS"]
 
     seats_left = number_of_seats - df_group_adjusted["INITIAL_SEATS"].sum()
@@ -870,10 +890,14 @@ def _compute_winners_from_quota(file_id: str, df: pd.DataFrame) -> set:
         dist, votes = str(row["DISTRICT"]), float(row["VOTES"])
         dist_total = float(district_totals.get(dist, 1))
         if dist_total == 0: return 0.0
-        return round((votes / dist_total) * 100, 3)
+        return (votes / dist_total) * 100
 
     df_final_members["VOTE_PERC"] = df_final_members.apply(get_perc, axis=1)
-    df_final_members = df_final_members.sort_values(by="VOTE_PERC", ascending=False).reset_index(drop=True)
+    # Stable sort with raw votes as the tie-breaker so equal percentages never
+    # depend on row order.
+    df_final_members = df_final_members.sort_values(
+        by=["VOTE_PERC", "VOTES"], ascending=[False, False], kind="mergesort"
+    ).reset_index(drop=True)
 
     winners = set()
     group_seats_filled = {g: 0 for g in group_seats_won}
@@ -898,6 +922,40 @@ def _compute_winners_from_quota(file_id: str, df: pd.DataFrame) -> set:
                 # the name -- otherwise both same-named rows would end up
                 # flagged as winners even though only one of them won a seat.
                 winners.add(c_id if pd.notna(c_id) else str(c_name))
+
+    # A seat can stay open after the pass above: the list still owed a seat
+    # has no remaining candidate of that confession/district, while every
+    # remaining candidate for it belongs to a list that already filled its
+    # share. A parliamentary seat is never left vacant, so it goes to the
+    # best-ranked remaining candidate for that seat among the qualified lists
+    # (the same transfer the law applies when a list cannot fill a seat).
+    # Never triggered by the official 2018/2022 data, only by simulations.
+    for seat_idx in df_seats[df_seats["HOLDER"] == "NA"].index:
+        seat_dist, seat_rel = df_seats.loc[seat_idx, "DISTRICT"], df_seats.loc[seat_idx, "RELIGION"]
+        for _, row in df_final_members.iterrows():
+            c_id = row["CANDIDATE_ID"] if pd.notna(row["CANDIDATE_ID"]) else str(row["MEMBER"])
+            if c_id in winners:
+                continue
+            if normalize_arabic(row["DISTRICT"]) != seat_dist or normalize_arabic(row["RELIGION"]) != seat_rel:
+                continue
+            df_seats.loc[seat_idx, "HOLDER"] = row["MEMBER"]
+            df_seats.loc[seat_idx, "GROUP"] = row["GROUP"]
+            winners.add(c_id)
+            break
+        else:
+            # No candidate left for this seat on any qualified list (possible
+            # only when the qualified lists are incomplete): take the
+            # highest-voted remaining candidate for the seat on any list.
+            for _, row in df.sort_values("VOTES", ascending=False).iterrows():
+                c_id = row["CANDIDATE_ID"] if pd.notna(row["CANDIDATE_ID"]) else str(row["MEMBER"])
+                if c_id in winners:
+                    continue
+                if normalize_arabic(row["DISTRICT"]) != seat_dist or normalize_arabic(row["RELIGION"]) != seat_rel:
+                    continue
+                df_seats.loc[seat_idx, "HOLDER"] = row["MEMBER"]
+                df_seats.loc[seat_idx, "GROUP"] = row["GROUP"]
+                winners.add(c_id)
+                break
 
     return winners
 
@@ -1017,7 +1075,7 @@ def calculate_votes_needed_for_one_group(file_id, df, target_group, target_k):
     eq2 = adjusted_electoral / num_seats
     df_adj = df_group[df_group["USED"] == 1].copy()
     df_adj["QUOTIENT"] = df_adj["VOTES"] / eq2
-    df_adj["INITIAL_SEATS"] = df_adj["QUOTIENT"].apply(lambda x: math.floor(round(x, 3)))
+    df_adj["INITIAL_SEATS"] = df_adj["QUOTIENT"].apply(lambda x: math.floor(round(x, 9)))
     df_adj["ADVANTAGE"] = df_adj["QUOTIENT"] - df_adj["INITIAL_SEATS"]
     seats_left = int(num_seats - df_adj["INITIAL_SEATS"].sum())
     df_adj = df_adj.sort_values(by="ADVANTAGE", ascending=False).reset_index(drop=True)             #sort the adjusted groups by their advantage to determine which groups are closest to gaining additional seats
@@ -1213,6 +1271,290 @@ def build_report_tables(file_id: str):
         "district_summary": district_summary,
         "winners": winners,
     }                                               #return a dictionary containing DataFrames for candidates, list summary, district summary, and winners for a given file_id; return None if the candidates DataFrame is not available
+
+def build_excel_report(file_id: str, district_label: str):
+    """Build the multi-sheet Excel report for one district/year (current scenario).
+
+    Returns a BytesIO, or None when the data is not available."""
+    from openpyxl.styles import Alignment, Border, Font, PatternFill, Side
+    from openpyxl.utils import get_column_letter
+
+    df = get_candidates_df(file_id)
+    if df is None:
+        return None
+    year, district_code = parse_file_id(file_id)
+    df = df.copy()
+    df["VOTES"] = pd.to_numeric(df["VOTES"], errors="coerce").fillna(0).astype(int)
+    df["IS_WINNER"] = df["IS_WINNER"].astype(bool)
+    df["LIST"] = df["GROUP"].map(strip_list_number)
+
+    quota = get_quota(file_id)
+    rel_limits = quota.get("rel_limits", {})
+    num_seats = int(sum(rel_limits.values()))
+
+    # ---- list-level allocation (same rules as _compute_winners_from_quota)
+    totals = group_vote_totals(file_id, df)
+    cand_votes = df.groupby("GROUP")["VOTES"].sum().to_dict()
+    total_valid = int(totals["VOTES"].sum())
+    q1 = total_valid / num_seats if num_seats else 0
+    totals["QUALIFIED"] = totals["VOTES"] >= q1
+    qualified_votes = int(totals.loc[totals["QUALIFIED"], "VOTES"].sum())
+    q2 = qualified_votes / num_seats if num_seats else 0
+    seats_by_list = df[df["IS_WINNER"]].groupby("GROUP").size().to_dict()
+
+    list_rows = []
+    for _, r in totals.sort_values("VOTES", ascending=False).iterrows():
+        g, v, ok = r["GROUP"], int(r["VOTES"]), bool(r["QUALIFIED"])
+        quotient = (v / q2) if (ok and q2) else None
+        whole = math.floor(round(quotient, 9)) if quotient is not None else None
+        won = int(seats_by_list.get(g, 0))
+        list_rows.append({
+            "Rank": len(list_rows) + 1,
+            "List": strip_list_number(g),
+            "Candidates": int((df["GROUP"] == g).sum()),
+            "Candidate votes": int(cand_votes.get(g, 0)),
+            "List-only votes": v - int(cand_votes.get(g, 0)),
+            "Total votes": v,
+            "% of valid votes": v / total_valid if total_valid else 0,
+            "Passed threshold": "Yes" if ok else "No",
+            "Quotient (votes / Q2)": round(quotient, 4) if quotient is not None else None,
+            "Whole seats": whole,
+            "Remainder": round(quotient - whole, 4) if quotient is not None else None,
+            "Seats won": won,
+            "Votes per seat": round(v / won) if won else None,
+        })
+    lists_df = pd.DataFrame(list_rows)
+
+    # ---- candidates
+    list_total = df.groupby("GROUP")["VOTES"].transform("sum")
+    seat_total = df.groupby(["DISTRICT", "RELIGION"])["VOTES"].transform("sum")
+    qualified_groups = set(totals.loc[totals["QUALIFIED"], "GROUP"])
+    qual_mask = df["GROUP"].isin(qualified_groups)
+    qada_total = df[qual_mask].groupby("DISTRICT")["VOTES"].sum().to_dict()
+    df["PCT_LIST"] = (df["VOTES"] / list_total.where(list_total > 0)).fillna(0)
+    df["PCT_SEAT"] = (df["VOTES"] / seat_total.where(seat_total > 0)).fillna(0)
+    df["PCT_ALLOC"] = [
+        (v / qada_total[d]) if (q and qada_total.get(d)) else None
+        for v, d, q in zip(df["VOTES"], df["DISTRICT"], qual_mask)
+    ]
+    df["RANK_SEAT"] = df.groupby(["DISTRICT", "RELIGION"])["VOTES"].rank(method="min", ascending=False).astype(int)
+
+    original = load_original_df(file_id)
+    orig_group = dict(zip(original["CANDIDATE_ID"], original["GROUP"])) if original is not None else {}
+    df["ORIG_LIST"] = [strip_list_number(orig_group.get(cid, g)) for cid, g in zip(df["CANDIDATE_ID"], df["GROUP"])]
+    df["MOVED"] = df["ORIG_LIST"] != df["LIST"]
+    party_map = get_party_map(file_id)
+    df["PARTY"] = [party_map.get(str(cid), "") for cid in df["CANDIDATE_ID"]]
+
+    def cand_table(frame):
+        return pd.DataFrame({
+            "Candidate": frame["MEMBER"],
+            "Party": frame["PARTY"],
+            "List": frame["LIST"],
+            "Sect": frame["RELIGION"],
+            "District": frame["DISTRICT"],
+            "Votes": frame["VOTES"],
+            "% of list": frame["PCT_LIST"],
+            "% of seat votes": frame["PCT_SEAT"],
+            "Allocation % (district)": frame["PCT_ALLOC"],
+            "Rank for seat": frame["RANK_SEAT"],
+            "Result": ["Winner" if w else "Not elected" for w in frame["IS_WINNER"]],
+            "Original list": frame["ORIG_LIST"],
+            "Moved": ["Yes" if m else "" for m in frame["MOVED"]],
+        })
+
+    candidates_df = cand_table(df.sort_values(["IS_WINNER", "VOTES"], ascending=[False, False]))
+    winners_df = cand_table(df[df["IS_WINNER"]].sort_values(["DISTRICT", "RELIGION", "VOTES"], ascending=[True, True, False]))
+
+    # ---- seats (sect x district)
+    seat_rows = []
+    for (dist, rel), g in df.groupby(["DISTRICT", "RELIGION"]):
+        w = g[g["IS_WINNER"]].sort_values("VOTES", ascending=False)
+        losers = g[~g["IS_WINNER"]].sort_values("VOTES", ascending=False)
+        margin = None
+        if not w.empty and not losers.empty:
+            margin = int(w["VOTES"].min()) - int(losers.iloc[0]["VOTES"])
+        seat_rows.append({
+            "District": dist, "Sect": rel,
+            "Seats": int(rel_limits.get((normalize_arabic(dist), normalize_arabic(rel)), 0)),
+            "Candidates": len(g), "Total votes": int(g["VOTES"].sum()),
+            "Winner(s)": "، ".join(f"{n} ({l})" for n, l in zip(w["MEMBER"], w["LIST"])),
+            "Lowest winner votes": int(w["VOTES"].min()) if not w.empty else None,
+            "Best non-elected": losers.iloc[0]["MEMBER"] if not losers.empty else None,
+            "Best non-elected votes": int(losers.iloc[0]["VOTES"]) if not losers.empty else None,
+            "Vote gap (winner - best non-elected)": margin,
+        })
+    seats_df = pd.DataFrame(seat_rows)
+
+    # ---- scenario changes against the original lists
+    changes_df = pd.DataFrame({
+        "Candidate": df.loc[df["MOVED"], "MEMBER"], "Sect": df.loc[df["MOVED"], "RELIGION"],
+        "District": df.loc[df["MOVED"], "DISTRICT"], "Votes": df.loc[df["MOVED"], "VOTES"],
+        "Original list": df.loc[df["MOVED"], "ORIG_LIST"], "Current list": df.loc[df["MOVED"], "LIST"],
+        "Result now": ["Winner" if w else "Not elected" for w in df.loc[df["MOVED"], "IS_WINNER"]],
+    })
+    seat_change_df = pd.DataFrame()
+    if original is not None:
+        orig_winners = _compute_winners_from_quota(file_id, original)
+        orig_seats = original[original["CANDIDATE_ID"].isin(orig_winners)].groupby("GROUP").size().to_dict()
+        orig_votes = group_vote_totals(file_id, original)
+        orig_votes = dict(zip(orig_votes["GROUP"], orig_votes["VOTES"].astype(int)))
+        cur_votes = dict(zip(totals["GROUP"], totals["VOTES"].astype(int)))
+        rows = []
+        for g in sorted(set(orig_votes) | set(cur_votes), key=lambda x: -cur_votes.get(x, 0)):
+            rows.append({
+                "List": strip_list_number(g),
+                "Original votes": orig_votes.get(g, 0), "Current votes": cur_votes.get(g, 0),
+                "Vote change": cur_votes.get(g, 0) - orig_votes.get(g, 0),
+                "Original seats": int(orig_seats.get(g, 0)), "Current seats": int(seats_by_list.get(g, 0)),
+                "Seat change": int(seats_by_list.get(g, 0)) - int(orig_seats.get(g, 0)),
+            })
+        seat_change_df = pd.DataFrame(rows)
+
+    # ---- areas (from the ballot-pen data; original lists)
+    areas_df = pd.DataFrame()
+    try:
+        with DB_ENGINE.connect() as conn:
+            pen = pd.read_sql(text("""
+                SELECT v.neighborhood AS area, v.ballot_pen AS pen, v.candidate_id AS cid, v.votes
+                FROM election_pen_votes v
+                WHERE v.year = :year AND v.district_code = :d
+                  AND v.neighborhood IS NOT NULL AND v.neighborhood NOT IN ('', 'nan')
+            """), conn, params={"year": year, "d": district_code})
+        if not pen.empty:
+            pen["list"] = pen["cid"].map(dict(zip(df["CANDIDATE_ID"].astype(str), df["ORIG_LIST"])))
+            pen["name"] = pen["cid"].map(dict(zip(df["CANDIDATE_ID"].astype(str), df["MEMBER"])))
+            rows = []
+            for area, g in pen.groupby("area"):
+                by_list = g.groupby("list")["votes"].sum().sort_values(ascending=False)
+                by_cand = g.groupby("name")["votes"].sum().sort_values(ascending=False)
+                tot = int(g["votes"].sum())
+                rows.append({
+                    "City / area": area, "Ballot pens": g["pen"].nunique(), "Candidate votes": tot,
+                    "Leading list": by_list.index[0] if len(by_list) else None,
+                    "Leading list votes": int(by_list.iloc[0]) if len(by_list) else None,
+                    "Leading list share": (by_list.iloc[0] / tot) if tot and len(by_list) else None,
+                    "Second list": by_list.index[1] if len(by_list) > 1 else None,
+                    "Second list votes": int(by_list.iloc[1]) if len(by_list) > 1 else None,
+                    "Top candidate": by_cand.index[0] if len(by_cand) else None,
+                    "Top candidate votes": int(by_cand.iloc[0]) if len(by_cand) else None,
+                })
+            areas_df = pd.DataFrame(rows).sort_values("Candidate votes", ascending=False)
+    except Exception as exc:
+        print(f"Excel export: area sheet skipped ({exc})")
+
+    moved_count = int(df["MOVED"].sum())
+    summary_rows = [
+        ("District", district_label), ("Election year", year),
+        ("Scenario", "Original lists" if moved_count == 0 else f"Modified — {moved_count} candidate(s) moved"),
+        ("Generated", datetime.now().strftime("%Y-%m-%d %H:%M")),
+        ("", ""),
+        ("Seats", num_seats), ("Lists", int(len(totals))), ("Candidates", int(len(df))),
+        ("Candidate (preferential) votes", int(df["VOTES"].sum())),
+        ("List-only votes", total_valid - int(df["VOTES"].sum())),
+        ("Total valid list votes", total_valid),
+        ("", ""),
+        ("First electoral quotient (Q1 = votes / seats)", round(q1, 2)),
+        ("Lists that passed Q1", int(totals["QUALIFIED"].sum())),
+        ("Votes of qualified lists", qualified_votes),
+        ("Second quotient (Q2 = qualified votes / seats)", round(q2, 2)),
+        ("", ""),
+        ("Note", "Blank and invalid ballots are not included in these totals."),
+        ("Note", "Allocation % = candidate votes / votes of qualified lists' candidates in the same district."),
+    ]
+    summary_df = pd.DataFrame(summary_rows, columns=["Item", "Value"])
+
+    sheets = [("Summary", summary_df), ("Lists", lists_df), ("Winners", winners_df),
+              ("Candidates", candidates_df), ("Seats", seats_df)]
+    if not seat_change_df.empty:
+        sheets.append(("Scenario - lists", seat_change_df))
+    if not changes_df.empty:
+        sheets.append(("Scenario - moves", changes_df))
+    if not areas_df.empty:
+        sheets.append(("Areas", areas_df))
+    if party_map:
+        known = df[df["PARTY"] != ""]
+        party_rows = []
+        for party, g in known.groupby("PARTY"):
+            top = g.sort_values("VOTES", ascending=False).iloc[0]
+            party_rows.append({
+                "Party": party, "Candidates": len(g), "Votes": int(g["VOTES"].sum()),
+                "% of candidate votes": g["VOTES"].sum() / max(1, int(df["VOTES"].sum())),
+                "Seats won": int(g["IS_WINNER"].sum()),
+                "Winners": "، ".join(g[g["IS_WINNER"]].sort_values("VOTES", ascending=False)["MEMBER"]),
+                "Top candidate": top["MEMBER"], "Top candidate votes": int(top["VOTES"]),
+            })
+        unknown = df[df["PARTY"] == ""]
+        if len(unknown):
+            party_rows.append({
+                "Party": "(unknown)", "Candidates": len(unknown), "Votes": int(unknown["VOTES"].sum()),
+                "% of candidate votes": unknown["VOTES"].sum() / max(1, int(df["VOTES"].sum())),
+                "Seats won": int(unknown["IS_WINNER"].sum()),
+                "Winners": "، ".join(unknown[unknown["IS_WINNER"]]["MEMBER"]),
+                "Top candidate": None, "Top candidate votes": None,
+            })
+        parties_df = pd.DataFrame(party_rows).sort_values(["Seats won", "Votes"], ascending=False)
+        sheets.insert(5, ("Parties", parties_df))
+
+    head_fill = PatternFill("solid", fgColor="1F4E78")
+    win_fill = PatternFill("solid", fgColor="E2F0D9")
+    bad_fill = PatternFill("solid", fgColor="FCE4D6")
+    thin = Side(style="thin", color="D9D9D9")
+    output = BytesIO()
+    with pd.ExcelWriter(output, engine="openpyxl") as writer:
+        for name, frame in sheets:
+            frame.to_excel(writer, index=False, sheet_name=name)
+            ws = writer.sheets[name]
+            headers = [c.value for c in ws[1]]
+            for cell in ws[1]:
+                cell.font = Font(bold=True, color="FFFFFF")
+                cell.fill = head_fill
+                cell.alignment = Alignment(horizontal="center", vertical="center", wrap_text=True)
+            ws.row_dimensions[1].height = 32
+            ws.freeze_panes = "A2"
+            if name != "Summary" and ws.max_row > 1:
+                ws.auto_filter.ref = ws.dimensions
+            for idx, header in enumerate(headers, 1):
+                letter = get_column_letter(idx)
+                h = str(header or "")
+                is_pct = h.startswith("%") or "share" in h.lower() or h.startswith("Allocation %")
+                longest = len(h)
+                for (cell,) in ws.iter_rows(min_row=2, min_col=idx, max_col=idx):
+                    cell.border = Border(bottom=thin)
+                    if cell.value is None:
+                        continue
+                    if is_pct and isinstance(cell.value, (int, float)):
+                        cell.number_format = "0.00%"
+                    elif isinstance(cell.value, int) and not isinstance(cell.value, bool):
+                        cell.number_format = "#,##0"
+                    longest = max(longest, len(str(cell.value)))
+                ws.column_dimensions[letter].width = max(10, min(longest + 3, 48))
+            # row highlights
+            if "Result" in headers or "Result now" in headers:
+                col = headers.index("Result" if "Result" in headers else "Result now") + 1
+                for row in ws.iter_rows(min_row=2):
+                    if row[col - 1].value == "Winner":
+                        for cell in row: cell.fill = win_fill
+            if "Passed threshold" in headers:
+                col = headers.index("Passed threshold") + 1
+                for row in ws.iter_rows(min_row=2):
+                    fill = win_fill if row[col - 1].value == "Yes" else bad_fill
+                    row[col - 1].fill = fill
+            if "Seat change" in headers:
+                col = headers.index("Seat change") + 1
+                for row in ws.iter_rows(min_row=2):
+                    v = row[col - 1].value or 0
+                    if v > 0: row[col - 1].fill = win_fill
+                    elif v < 0: row[col - 1].fill = bad_fill
+            if name == "Summary":
+                ws.column_dimensions["A"].width = 46
+                ws.column_dimensions["B"].width = 60
+                for row in ws.iter_rows(min_row=2):
+                    row[0].font = Font(bold=True)
+                    row[1].alignment = Alignment(horizontal="left", wrap_text=True)
+    output.seek(0)
+    return output
+
 
 def make_compare_payload(slug: str):
     info = get_region_from_database(slug)
@@ -1472,7 +1814,8 @@ def region_detail(slug):
     # would silently merge them into a single card, hiding one entirely.
     df_agg = df.groupby("CANDIDATE_ID", as_index=False).agg({"MEMBER": "first", "GROUP": "first", "RELIGION": "first", "DISTRICT": "first", "IS_WINNER": "max", "VOTES": "sum"})
 
-    candidates = [{"id": str(r["CANDIDATE_ID"]), "name": str(r["MEMBER"]), "group": str(r["GROUP"]), "votes": int(r["VOTES"]), "religion": str(r["RELIGION"]), "district": str(r["DISTRICT"]), "is_winner": bool(r["IS_WINNER"])} for _, r in df_agg.iterrows()]
+    party_map = get_party_map(file_id)
+    candidates = [{"id": str(r["CANDIDATE_ID"]), "name": str(r["MEMBER"]), "group": str(r["GROUP"]), "votes": int(r["VOTES"]), "religion": str(r["RELIGION"]), "district": str(r["DISTRICT"]), "is_winner": bool(r["IS_WINNER"]), "party": party_map.get(str(r["CANDIDATE_ID"]), "")} for _, r in df_agg.iterrows()]
 
     grouped = {}
     for c in candidates: grouped.setdefault(c["group"], []).append(c)
@@ -1613,6 +1956,7 @@ def candidate_pens():
         candidate={
             "name": str(cand["MEMBER"]), "group": strip_list_number(cand["GROUP"]),
             "religion": str(cand["RELIGION"]), "district": str(cand["DISTRICT"]),
+            "party": get_party_map(file_id).get(str(cand["CANDIDATE_ID"]), ""),
             "votes": int(cand["VOTES"]), "is_winner": bool(cand["IS_WINNER"]),
         },
         pens=top, pens_count=len(rows), pens_total_votes=pens_total_votes,
@@ -1732,6 +2076,248 @@ def pen_voters():
     )
 
 
+def get_party_map(file_id: str) -> dict:
+    """{candidate_id: party} for one district/year. Candidates whose party is
+    unknown are simply absent. Party data exists for 2022 only."""
+    request_cache = _request_dict("party_cache")
+    if request_cache is not None and file_id in request_cache:
+        return request_cache[file_id]
+    year, district_code = parse_file_id(file_id)
+    result = {}
+    if year is not None:
+        try:
+            with DB_ENGINE.connect() as conn:
+                rows = conn.execute(text("""
+                    SELECT CAST(candidate_id AS TEXT), party FROM election_members
+                    WHERE year = :year AND district_code = :d
+                      AND party IS NOT NULL AND TRIM(party) <> ''
+                """), {"year": year, "d": district_code}).all()
+            result = {str(cid): str(party).strip() for cid, party in rows}
+        except Exception as exc:
+            print(f"Party load failed for {file_id}: {exc}")
+    if request_cache is not None:
+        request_cache[file_id] = result
+    return result
+
+
+def build_parties_payload(year: str):
+    """Party analytics across every district for one year (current scenario)."""
+    UNKNOWN = "Unknown"
+    parties = {}
+    district_labels = []
+    totals = {"candidates": 0, "votes": 0, "seats": 0}
+
+    for region in deduplicated_display_regions(load_regions_from_database()):
+        file_id = region["files"].get(year)
+        df = get_candidates_df(file_id) if file_id else None
+        if df is None or df.empty:
+            continue
+        label = region["district_label"]
+        district_labels.append(label)
+        party_map = get_party_map(file_id)
+        for _, r in df.iterrows():
+            party = party_map.get(str(r["CANDIDATE_ID"])) or UNKNOWN
+            votes, won = int(r["VOTES"]), bool(r["IS_WINNER"])
+            entry = parties.setdefault(party, {
+                "candidates": 0, "votes": 0, "seats": 0, "districts": {}, "sects": {}, "top": None, "winners": [],
+            })
+            entry["candidates"] += 1
+            entry["votes"] += votes
+            entry["seats"] += int(won)
+            d = entry["districts"].setdefault(label, {"seats": 0, "votes": 0, "candidates": 0})
+            d["seats"] += int(won); d["votes"] += votes; d["candidates"] += 1
+            if won:
+                entry["sects"][str(r["RELIGION"])] = entry["sects"].get(str(r["RELIGION"]), 0) + 1
+                entry["winners"].append({"name": str(r["MEMBER"]), "votes": votes, "district": label,
+                                         "sect": str(r["RELIGION"]), "list": strip_list_number(r["GROUP"])})
+            if entry["top"] is None or votes > entry["top"]["votes"]:
+                entry["top"] = {"name": str(r["MEMBER"]), "votes": votes, "district": label}
+            totals["candidates"] += 1; totals["votes"] += votes; totals["seats"] += int(won)
+
+    rows = []
+    for name, e in parties.items():
+        rows.append({
+            "name": name, "is_unknown": name == UNKNOWN,
+            "candidates": e["candidates"], "votes": e["votes"], "seats": e["seats"],
+            "vote_share": round(e["votes"] / totals["votes"] * 100, 2) if totals["votes"] else 0.0,
+            "seat_share": round(e["seats"] / totals["seats"] * 100, 1) if totals["seats"] else 0.0,
+            "win_rate": round(e["seats"] / e["candidates"] * 100, 1) if e["candidates"] else 0.0,
+            "avg_votes": round(e["votes"] / e["candidates"]) if e["candidates"] else 0,
+            "votes_per_seat": round(e["votes"] / e["seats"]) if e["seats"] else None,
+            "district_count": len(e["districts"]),
+            "top": e["top"], "districts": e["districts"],
+            "sects": sorted(e["sects"].items(), key=lambda kv: -kv[1]),
+            "winners": sorted(e["winners"], key=lambda w: -w["votes"]),
+        })
+    rows.sort(key=lambda r: (r["is_unknown"], -r["seats"], -r["votes"]))
+
+    known = [r for r in rows if not r["is_unknown"]]
+    unknown = next((r for r in rows if r["is_unknown"]), None)
+    coverage = {
+        "candidates_known": sum(r["candidates"] for r in known), "candidates_total": totals["candidates"],
+        "votes_known": sum(r["votes"] for r in known), "votes_total": totals["votes"],
+        "seats_known": sum(r["seats"] for r in known), "seats_total": totals["seats"],
+        "parties": len(known),
+    }
+    for key in ("candidates", "votes", "seats"):
+        total = coverage[f"{key}_total"]
+        coverage[f"{key}_pct"] = round(coverage[f"{key}_known"] / total * 100, 1) if total else 0.0
+
+    def bar(items, value_key, title, color):
+        if not items:
+            return "{}"
+        ordered = list(reversed(items))
+        fig = go.Figure(go.Bar(
+            x=[r[value_key] for r in ordered], y=[r["name"] for r in ordered], orientation="h",
+            marker_color=color, text=[f"{r[value_key]:,}" for r in ordered],
+            textposition="outside", cliponaxis=False,
+            hovertemplate="%{y}<br>" + title + ": %{x:,}<extra></extra>",
+        ))
+        fig.update_layout(
+            height=max(260, 30 * len(ordered) + 60), margin=dict(l=10, r=60, t=10, b=30),
+            plot_bgcolor="rgba(0,0,0,0)", paper_bgcolor="rgba(0,0,0,0)", bargap=0.3, showlegend=False,
+            xaxis=dict(title=title, showgrid=True, gridcolor="#eceff3", zeroline=False),
+            yaxis=dict(automargin=True, tickfont=dict(size=12, color="#212529")),
+        )
+        return json.dumps(fig, cls=plotly.utils.PlotlyJSONEncoder)
+
+    seat_parties = [r for r in known if r["seats"] > 0]
+    vote_parties = sorted(known, key=lambda r: -r["votes"])[:15]
+    matrix_districts = [d for d in district_labels if any(r["districts"].get(d, {}).get("seats") for r in seat_parties)]
+
+    return {
+        "has_data": bool(known), "party_rows": rows, "known_rows": known, "unknown_row": unknown,
+        "coverage": coverage, "seat_parties": seat_parties, "matrix_districts": matrix_districts,
+        "seats_chart_json": bar(seat_parties, "seats", "Seats", "#1b5e20"),
+        "votes_chart_json": bar(vote_parties, "votes", "Votes", "#3f51b5"),
+    }
+
+
+@app.route("/parties")
+def parties_dashboard():
+    selected_year = request.args.get("year", "2022")
+    if selected_year not in {"2018", "2022"}:
+        selected_year = "2022"
+    payload = build_parties_payload(selected_year)
+    return render_template("parties.html", current_year=selected_year, **payload)
+
+
+@app.route("/party")
+def party_detail():
+    """One political party: its strongest districts, cities/areas and ballot pens."""
+    party = request.args.get("name", "").strip()
+    year = request.args.get("year", "2022")
+    if year not in {"2018", "2022"}:
+        year = "2022"
+    if not party:
+        return "Party not found.", 404
+    top_n = 15
+
+    labels = {}
+    for region in deduplicated_display_regions(load_regions_from_database()):
+        file_id = region["files"].get(year)
+        if file_id:
+            labels[parse_file_id(file_id)[1]] = {"label": region["district_label"], "slug": region["slug"], "file_id": file_id}
+
+    params = {"year": int(year), "party": party}
+    with DB_ENGINE.connect() as conn:
+        cand_rows = conn.execute(text("""
+            SELECT m.district_code, CAST(m.candidate_id AS TEXT) AS cid, m.member, m.group_name, m.religion,
+                   m.district, m.is_winner, COALESCE(SUM(v.votes), 0)::bigint AS votes
+            FROM election_members m
+            LEFT JOIN election_votes v
+              ON v.year = m.year AND v.district_code = m.district_code AND v.candidate_id = m.candidate_id
+            WHERE m.year = :year AND m.party = :party
+            GROUP BY m.district_code, m.candidate_id, m.member, m.group_name, m.religion, m.district, m.is_winner
+            ORDER BY votes DESC
+        """), params).mappings().all()
+        if not cand_rows:
+            return "Party not found.", 404
+        district_totals = dict(conn.execute(text("""
+            SELECT district_code, COALESCE(SUM(votes), 0)::bigint
+            FROM election_votes WHERE year = :year AND candidate_id IS NOT NULL GROUP BY district_code
+        """), {"year": int(year)}).all())
+        area_rows = conn.execute(text("""
+            WITH party_votes AS (
+                SELECT v.district_code, v.neighborhood, SUM(v.votes)::bigint AS votes,
+                       COUNT(DISTINCT v.ballot_pen) AS pens
+                FROM election_pen_votes v
+                JOIN election_members m
+                  ON m.year = v.year AND m.district_code = v.district_code AND m.candidate_id = v.candidate_id
+                WHERE v.year = :year AND m.party = :party
+                  AND v.neighborhood IS NOT NULL AND v.neighborhood NOT IN ('', 'nan')
+                GROUP BY v.district_code, v.neighborhood
+                ORDER BY votes DESC LIMIT :n
+            )
+            SELECT p.*, (SELECT SUM(t.votes) FROM election_pen_votes t
+                         WHERE t.year = :year AND t.district_code = p.district_code
+                           AND t.neighborhood = p.neighborhood)::bigint AS total
+            FROM party_votes p ORDER BY p.votes DESC
+        """), {**params, "n": top_n}).mappings().all()
+        pen_rows = conn.execute(text("""
+            WITH party_votes AS (
+                SELECT v.district_code, v.ballot_pen, MAX(v.neighborhood) AS neighborhood,
+                       SUM(v.votes)::bigint AS votes
+                FROM election_pen_votes v
+                JOIN election_members m
+                  ON m.year = v.year AND m.district_code = v.district_code AND m.candidate_id = v.candidate_id
+                WHERE v.year = :year AND m.party = :party
+                GROUP BY v.district_code, v.ballot_pen
+                ORDER BY votes DESC LIMIT :n
+            )
+            SELECT p.*, (SELECT SUM(t.votes) FROM election_pen_votes t
+                         WHERE t.year = :year AND t.district_code = p.district_code
+                           AND t.ballot_pen = p.ballot_pen)::bigint AS total
+            FROM party_votes p ORDER BY p.votes DESC
+        """), {**params, "n": top_n}).mappings().all()
+
+    total_votes = sum(int(r["votes"]) for r in cand_rows)
+    districts = {}
+    for r in cand_rows:
+        d = districts.setdefault(r["district_code"], {"votes": 0, "candidates": 0, "seats": 0})
+        d["votes"] += int(r["votes"]); d["candidates"] += 1; d["seats"] += int(bool(r["is_winner"]))
+    district_list = []
+    for code, d in districts.items():
+        info = labels.get(code, {"label": code, "slug": None, "file_id": f"{year}:{code}"})
+        total = int(district_totals.get(code, 0))
+        district_list.append({
+            "label": info["label"], "slug": info["slug"], **d,
+            "share": round(d["votes"] / total * 100, 1) if total else 0.0,
+            "of_party": round(d["votes"] / total_votes * 100, 1) if total_votes else 0.0,
+        })
+    district_list.sort(key=lambda x: -x["votes"])
+
+    def place(code):
+        info = labels.get(code, {})
+        return info.get("label", code), info.get("file_id", f"{year}:{code}")
+
+    areas = []
+    for r in area_rows:
+        label, file_id = place(r["district_code"])
+        total = int(r["total"] or 0)
+        areas.append({"name": r["neighborhood"], "district": label, "file_id": file_id, "votes": int(r["votes"]),
+                      "pens": int(r["pens"]), "share": round(int(r["votes"]) / total * 100, 1) if total else 0.0})
+    pens = []
+    for r in pen_rows:
+        label, file_id = place(r["district_code"])
+        total = int(r["total"] or 0)
+        pens.append({"name": r["ballot_pen"], "area": r["neighborhood"] or "", "district": label, "file_id": file_id,
+                     "votes": int(r["votes"]), "share": round(int(r["votes"]) / total * 100, 1) if total else 0.0})
+
+    candidates = []
+    for r in cand_rows:
+        label, file_id = place(r["district_code"])
+        candidates.append({"id": r["cid"], "name": r["member"], "list": strip_list_number(r["group_name"]),
+                           "sect": r["religion"], "qada": r["district"], "district": label, "file_id": file_id,
+                           "votes": int(r["votes"]), "is_winner": bool(r["is_winner"])})
+
+    return render_template(
+        "party.html", party=party, year=year, total_votes=total_votes,
+        seats=sum(1 for c in candidates if c["is_winner"]), candidates=candidates,
+        districts=district_list, areas=areas, pens=pens, top_n=top_n,
+    )
+
+
 @app.route("/national")
 def national_dashboard():
     selected_year = request.args.get("year", "2022")
@@ -1753,21 +2339,9 @@ def export_report(file_id, fmt):
     base_name = safe_download_name(f"{district_label}_{year}_election_report")
 
     if fmt in ["xlsx", "excel"]:
-        output = BytesIO()
-        with pd.ExcelWriter(output, engine="openpyxl") as writer:
-            tables["list_summary"].to_excel(writer, index=False, sheet_name="List Summary")
-            tables["winners"].to_excel(writer, index=False, sheet_name="Winners")
-            tables["candidates"].to_excel(writer, index=False, sheet_name="Candidates")
-            tables["district_summary"].to_excel(writer, index=False, sheet_name="District Summary")
-
-            for sheet_name in writer.sheets:
-                ws = writer.sheets[sheet_name]
-                ws.freeze_panes = "A2"
-                for col_cells in ws.columns:
-                    max_len = max(len(str(cell.value or "")) for cell in col_cells)
-                    ws.column_dimensions[col_cells[0].column_letter].width = min(max_len + 2, 45)
-
-        output.seek(0)
+        output = build_excel_report(file_id, district_label)
+        if output is None:
+            return "Data not found.", 404
         return send_file(
             output,
             as_attachment=True,
@@ -2112,10 +2686,11 @@ def change_candidate_group():
     candidate_id = data.get("candidate_id")
     try:
         old_group = update_candidate_group_db(file_id, candidate_name, new_group, candidate_id)
-        recompute_winners(file_id)
+        winners = recompute_winners(file_id)
         df = get_candidates_df(file_id)
         return jsonify({
             "success": True,
+            "winner_ids": sorted(str(w) for w in winners),
             "candidate": candidate_name,
             "old_group": old_group,
             "new_group": new_group,
@@ -2139,12 +2714,13 @@ def swap_candidates():
     target_id = data.get("target_id")
     try:
         swap = swap_candidate_groups_db(file_id, source_name, target_name, source_id, target_id)
-        recompute_winners(file_id)
+        winners = recompute_winners(file_id)
         df = get_candidates_df(file_id)
         source_group = swap["source_group"]
         target_group = swap["target_group"]
         return jsonify({
             "success": True,
+            "winner_ids": sorted(str(w) for w in winners),
             "src_name": source_name,
             "target_name": target_name,
             "src_group": source_group,
@@ -2168,8 +2744,9 @@ def multi_swap_candidates():
     swaps = data.get("swaps", [])
     try:
         updated = multi_swap_candidate_groups_db(file_id, swaps)
-        recompute_winners(file_id)
-        return jsonify({"success": True, "updated_candidates": updated})
+        winners = recompute_winners(file_id)
+        return jsonify({"success": True, "updated_candidates": updated,
+                        "winner_ids": sorted(str(w) for w in winners)})
     except LookupError as exc:
         return jsonify({"success": False, "message": str(exc)}), 404
     except ValueError as exc:
@@ -2181,9 +2758,10 @@ def api_recompute_results():
     file_id = (request.json or {}).get("filename")
     try:
         winners = recompute_winners(file_id)
+        # recompute_winners() returns candidate_id values, not names.
         return jsonify({
             "success": True,
-            "winner_names": sorted(winners),
+            "winner_ids": sorted(str(w) for w in winners),
             "winner_count": len(winners),
         })
     except Exception as exc:

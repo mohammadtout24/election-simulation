@@ -1,0 +1,182 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Party Analytics — {{ current_year }}</title>
+    <link href="https://cdn.jsdelivr.net/npm/bootstrap@5.1.3/dist/css/bootstrap.min.css" rel="stylesheet">
+    <script src="https://cdn.plot.ly/plotly-2.24.1.min.js"></script>
+    <style>
+        body { background:#f4f6f9; }
+        .summary-card { border:0; border-radius:16px; box-shadow:0 4px 16px rgba(0,0,0,0.07); }
+        .metric { font-size:1.7rem; font-weight:800; }
+        .table-card { border:0; border-radius:16px; overflow:hidden; box-shadow:0 4px 16px rgba(0,0,0,0.07); }
+        .rank-badge { display:inline-flex; align-items:center; justify-content:center; width:24px; height:24px; border-radius:50%; background:#eef2ff; color:#0d6efd; font-weight:700; font-size:0.75rem; }
+        .unknown-row td { color:#6c757d; font-style:italic; background:#fafafa; }
+        .seat-cell { font-weight:700; color:#1b5e20; }
+        .zero-cell { color:#ced4da; }
+        .winner-chip { display:inline-block; margin:2px; padding:3px 8px; border-radius:999px; background:#e8f5e9; font-size:0.78rem; }
+        details summary { cursor:pointer; color:#0d6efd; font-size:0.8rem; }
+        th { white-space:nowrap; }
+        .party-link { color:#5e35b1; text-decoration:none; }
+        .party-link:hover { text-decoration:underline; }
+    </style>
+</head>
+<body>
+<div class="container-fluid px-4 py-4">
+    <div class="d-flex justify-content-between align-items-center flex-wrap gap-2 mb-4">
+        <div>
+            <h3 class="fw-bold mb-1">Party Analytics — {{ current_year }}</h3>
+            <div class="text-muted">Votes and seats by political party across every district. Reflects any what-if edits currently applied.</div>
+        </div>
+        <div class="d-flex gap-2">
+            <a href="/national?year={{ current_year }}" class="btn btn-outline-success fw-bold">🏛️ National Results</a>
+            <a href="/?year={{ current_year }}" class="btn btn-outline-dark">← Map</a>
+        </div>
+    </div>
+
+    {% if not has_data %}
+    <div class="alert alert-warning">No political-party data is available for {{ current_year }}. Party information exists for the 2022 election only.
+        <a href="/parties?year=2022" class="alert-link">Open 2022</a>.</div>
+    {% else %}
+
+    <div class="row g-3 mb-3">
+        <div class="col-6 col-md-3"><div class="card summary-card h-100 text-center"><div class="card-body">
+            <div class="metric">{{ coverage.parties }}</div><div class="text-muted small">Parties / affiliations</div></div></div></div>
+        <div class="col-6 col-md-3"><div class="card summary-card h-100 text-center"><div class="card-body">
+            <div class="metric">{{ coverage.candidates_known }} <span class="fs-6 text-muted">/ {{ coverage.candidates_total }}</span></div>
+            <div class="text-muted small">Candidates with a known party ({{ coverage.candidates_pct }}%)</div></div></div></div>
+        <div class="col-6 col-md-3"><div class="card summary-card h-100 text-center"><div class="card-body">
+            <div class="metric">{{ coverage.votes_pct }}%</div>
+            <div class="text-muted small">Of candidate votes covered ({{ "{:,}".format(coverage.votes_known) }})</div></div></div></div>
+        <div class="col-6 col-md-3"><div class="card summary-card h-100 text-center"><div class="card-body">
+            <div class="metric">{{ coverage.seats_known }} <span class="fs-6 text-muted">/ {{ coverage.seats_total }}</span></div>
+            <div class="text-muted small">Seats won by candidates with a known party</div></div></div></div>
+    </div>
+    <div class="alert alert-light border small mb-4">
+        Party labels come from the 2022 candidate files and are shown exactly as recorded, so “مستقل” (independent), “(سابقاً)” (former) and “مقرب من / مدعوم من” (close to / backed by) are separate rows.
+        Candidates with no recorded party are grouped under <b>Unknown</b> and left out of the charts.
+    </div>
+
+    <div class="row g-3 mb-4">
+        <div class="col-lg-6">
+            <div class="card table-card h-100">
+                <div class="card-header bg-white fw-bold">Seats by party</div>
+                <div class="card-body"><div id="seatsChart"></div></div>
+            </div>
+        </div>
+        <div class="col-lg-6">
+            <div class="card table-card h-100">
+                <div class="card-header bg-white fw-bold">Preferential votes by party (top 15)</div>
+                <div class="card-body"><div id="votesChart"></div></div>
+            </div>
+        </div>
+    </div>
+
+    <div class="card table-card mb-4">
+        <div class="card-header bg-white d-flex justify-content-between align-items-center flex-wrap gap-2">
+            <span class="fw-bold">All parties</span>
+            <input id="partySearch" class="form-control form-control-sm" style="max-width:260px;" placeholder="Search party..." oninput="filterRows('partyTable', this.value)">
+        </div>
+        <div class="table-responsive">
+            <table class="table table-hover align-middle mb-0" id="partyTable">
+                <thead class="table-light">
+                    <tr>
+                        <th>#</th><th>Party</th>
+                        <th class="text-end">Seats</th><th class="text-end">% of seats</th>
+                        <th class="text-end">Votes</th><th class="text-end">% of votes</th>
+                        <th class="text-end">Candidates</th><th class="text-end">Win rate</th>
+                        <th class="text-end">Avg votes / candidate</th><th class="text-end">Votes / seat</th>
+                        <th class="text-end">Districts</th><th>Top candidate</th><th>Winners</th>
+                    </tr>
+                </thead>
+                <tbody>
+                    {% for p in party_rows %}
+                    <tr class="{{ 'unknown-row' if p.is_unknown }}">
+                        <td>{% if not p.is_unknown %}<span class="rank-badge">{{ loop.index }}</span>{% endif %}</td>
+                        <td class="fw-bold">{% if p.is_unknown %}{{ p.name }}{% else %}<a class="party-link" href="/party?year={{ current_year }}&name={{ p.name | urlencode }}">{{ p.name }}</a>{% endif %}</td>
+                        <td class="text-end {{ 'seat-cell' if p.seats else 'zero-cell' }}">{{ p.seats }}</td>
+                        <td class="text-end">{{ p.seat_share }}%</td>
+                        <td class="text-end">{{ "{:,}".format(p.votes) }}</td>
+                        <td class="text-end">{{ p.vote_share }}%</td>
+                        <td class="text-end">{{ p.candidates }}</td>
+                        <td class="text-end">{{ p.win_rate }}%</td>
+                        <td class="text-end">{{ "{:,}".format(p.avg_votes) }}</td>
+                        <td class="text-end">{% if p.votes_per_seat %}{{ "{:,}".format(p.votes_per_seat) }}{% else %}<span class="zero-cell">—</span>{% endif %}</td>
+                        <td class="text-end">{{ p.district_count }}</td>
+                        <td>{% if p.top %}{{ p.top.name }} <span class="text-muted small">({{ "{:,}".format(p.top.votes) }} · {{ p.top.district }})</span>{% endif %}</td>
+                        <td>
+                            {% if p.winners %}
+                            <details><summary>{{ p.winners|length }} winner{{ 's' if p.winners|length > 1 }}</summary>
+                                {% for w in p.winners %}<span class="winner-chip">{{ w.name }} · {{ w.sect }} · {{ w.district }} · {{ "{:,}".format(w.votes) }}</span>{% endfor %}
+                            </details>
+                            {% else %}<span class="zero-cell">—</span>{% endif %}
+                        </td>
+                    </tr>
+                    {% endfor %}
+                </tbody>
+            </table>
+        </div>
+    </div>
+
+    {% if seat_parties and matrix_districts %}
+    <div class="card table-card mb-4">
+        <div class="card-header bg-white fw-bold">Seats by party and district</div>
+        <div class="table-responsive">
+            <table class="table table-sm table-hover align-middle mb-0 text-center">
+                <thead class="table-light">
+                    <tr><th class="text-start">Party</th>{% for d in matrix_districts %}<th>{{ d }}</th>{% endfor %}<th>Total</th></tr>
+                </thead>
+                <tbody>
+                    {% for p in seat_parties %}
+                    <tr>
+                        <td class="text-start fw-bold"><a class="party-link" href="/party?year={{ current_year }}&name={{ p.name | urlencode }}">{{ p.name }}</a></td>
+                        {% for d in matrix_districts %}
+                        {% set s = p.districts.get(d, {}).get('seats', 0) %}
+                        <td class="{{ 'seat-cell' if s else 'zero-cell' }}">{{ s if s else '·' }}</td>
+                        {% endfor %}
+                        <td class="fw-bold">{{ p.seats }}</td>
+                    </tr>
+                    {% endfor %}
+                </tbody>
+            </table>
+        </div>
+    </div>
+
+    <div class="card table-card mb-5">
+        <div class="card-header bg-white fw-bold">Seats by party and sect</div>
+        <div class="table-responsive">
+            <table class="table table-sm table-hover align-middle mb-0">
+                <thead class="table-light"><tr><th>Party</th><th class="text-end">Seats</th><th>Sects of its winners</th></tr></thead>
+                <tbody>
+                    {% for p in seat_parties %}
+                    <tr>
+                        <td class="fw-bold">{{ p.name }}</td>
+                        <td class="text-end seat-cell">{{ p.seats }}</td>
+                        <td>{% for sect, n in p.sects %}<span class="winner-chip">{{ sect }}: {{ n }}</span>{% endfor %}</td>
+                    </tr>
+                    {% endfor %}
+                </tbody>
+            </table>
+        </div>
+    </div>
+    {% endif %}
+    {% endif %}
+</div>
+
+<script>
+    function filterRows(tableId, q) {
+        q = (q || '').trim().toLowerCase();
+        document.querySelectorAll('#' + tableId + ' tbody tr').forEach(row => {
+            row.style.display = row.textContent.toLowerCase().includes(q) ? '' : 'none';
+        });
+    }
+    {% if has_data %}
+    const seatsChart = {{ seats_chart_json | safe }};
+    const votesChart = {{ votes_chart_json | safe }};
+    if (seatsChart.data) Plotly.newPlot('seatsChart', seatsChart.data, seatsChart.layout, {responsive:true, displayModeBar:false});
+    if (votesChart.data) Plotly.newPlot('votesChart', votesChart.data, votesChart.layout, {responsive:true, displayModeBar:false});
+    {% endif %}
+</script>
+</body>
+</html>
