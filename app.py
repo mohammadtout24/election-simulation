@@ -2235,7 +2235,9 @@ def party_detail():
             ORDER BY votes DESC
         """), params).mappings().all()
         if not cand_rows:
-            return "Party not found.", 404
+            # The party may simply not have run in this year (the page has a year toggle).
+            return render_template("party.html", party=party, year=year, total_votes=0, seats=0,
+                                   candidates=[], districts=[], areas=[], pens=[], top_n=top_n)
         district_totals = dict(conn.execute(text("""
             SELECT district_code, COALESCE(SUM(votes), 0)::bigint
             FROM election_votes WHERE year = :year AND candidate_id IS NOT NULL GROUP BY district_code

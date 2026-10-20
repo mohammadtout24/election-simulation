@@ -1,11 +1,11 @@
-"""Import each 2022 candidate's political party into election_members.party.
+"""Import each candidate's political party into election_members.party (2018 and 2022).
 
 Source: the "Political Party" column of <District>_members_final.xlsx (falls
 back to <District>_members.xlsx). Candidates are matched to the database by
 normalized name (and list, when a name is repeated). "Not Found"/blank values
 are stored as NULL. Only the party column is written. Usage:
 
-    PYTHONIOENCODING=utf-8 python migrations/import_parties.py [--dry-run]
+    PYTHONIOENCODING=utf-8 python migrations/import_parties.py [--dry-run] [2018|2022]
 """
 import os
 import re
@@ -18,7 +18,7 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from import_from_excel import BASE_DIR, DATABASE_URL, canon_group, find_file, normalize_district_code  # noqa: E402
 from arabic_utils import normalize_arabic  # noqa: E402
 
-YEAR = "2022"
+YEARS = ("2018", "2022")
 EMPTY = {"", "nan", "none", "not found", "غير محدد", "-"}
 
 
@@ -47,12 +47,17 @@ def load_parties(folder: str, district: str):
     return rows, path
 
 
-def main(dry_run: bool):
+def main(dry_run: bool, years=YEARS):
     engine = create_engine(DATABASE_URL, future=True)
     if not dry_run:
         with engine.begin() as conn:
             conn.execute(text("ALTER TABLE election_members ADD COLUMN IF NOT EXISTS party TEXT"))
 
+    for year in years:
+        import_year(engine, year, dry_run)
+
+
+def import_year(engine, YEAR: str, dry_run: bool):
     year_dir = os.path.join(BASE_DIR, YEAR)
     total_set = total_cands = 0
     for raw in sorted(os.listdir(year_dir)):
@@ -102,8 +107,9 @@ def main(dry_run: bool):
         note = f" -- {len(unmatched)} file row(s) not matched to a candidate" if unmatched else ""
         print(f"{YEAR} {district}: {'OK (dry run)' if dry_run else 'IMPORTED'} "
               f"party set for {len(updates)} of {len(members)} candidates{note}")
-    print(f"TOTAL: party known for {total_set} of {total_cands} candidates")
+    print(f"{YEAR} TOTAL: party known for {total_set} of {total_cands} candidates")
 
 
 if __name__ == "__main__":
-    main("--dry-run" in sys.argv)
+    chosen = tuple(a for a in sys.argv[1:] if a in YEARS) or YEARS
+    main("--dry-run" in sys.argv, chosen)

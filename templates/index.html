@@ -119,7 +119,7 @@
                     <a href="/?year=2022" class="btn btn-sm btn-year {{ 'btn-primary' if current_year == '2022' else 'btn-outline-secondary' }}">2022</a>
                 </div>
                 <a href="/national?year={{ current_year }}" class="btn btn-sm btn-outline-success w-100 mt-2 fw-bold">🏛️ National Results</a>
-                <a href="/parties?year=2022" class="btn btn-sm btn-outline-primary w-100 mt-2 fw-bold">🎗️ Party Analytics (2022)</a>
+                <a href="/parties?year={{ current_year }}" class="btn btn-sm btn-outline-primary w-100 mt-2 fw-bold">🎗️ Party Analytics</a>
                 <input id="districtSearch" class="form-control sidebar-search" type="search" placeholder="Search district..." oninput="filterDistricts()">
             </div>
 

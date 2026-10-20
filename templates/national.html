@@ -27,7 +27,7 @@
         <div class="d-flex gap-2">
             <a href="/national?year=2018" class="btn btn-{{ 'primary' if current_year == '2018' else 'outline-primary' }} fw-bold">2018</a>
             <a href="/national?year=2022" class="btn btn-{{ 'primary' if current_year == '2022' else 'outline-primary' }} fw-bold">2022</a>
-            <a href="/parties?year=2022" class="btn btn-outline-primary fw-bold">🎗️ Party Analytics</a>
+            <a href="/parties?year={{ current_year }}" class="btn btn-outline-primary fw-bold">🎗️ Party Analytics</a>
             <a href="/?year={{ current_year }}" class="btn btn-outline-dark">← Map</a>
         </div>
     </div>
