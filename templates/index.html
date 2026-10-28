@@ -97,6 +97,30 @@
             width: 100%;
             height: 100vh;
         }
+        .map-container { position: relative; }
+        .map-tooltip { position: absolute; z-index: 10; pointer-events: none; opacity: 0; transform: translateY(4px);
+            transition: opacity .12s ease, transform .12s ease; min-width: 210px; max-width: 280px;
+            background: #fff; border-radius: 14px; padding: 12px 14px; border-top: 4px solid #adb5bd;
+            box-shadow: 0 10px 28px rgba(15, 23, 42, 0.18); font-family: inherit; color: #1a1a2e; }
+        .map-tooltip.show { opacity: 1; transform: translateY(0); }
+        .map-tooltip .mt-title { font-weight: 800; font-size: 1rem; line-height: 1.2; }
+        .map-tooltip .mt-sub { color: #6c757d; font-size: 0.78rem; margin-bottom: 10px; }
+        .map-tooltip .mt-party { display: flex; align-items: center; gap: 8px; }
+        .map-tooltip .mt-dot { width: 11px; height: 11px; border-radius: 50%; flex-shrink: 0; }
+        .map-tooltip .mt-party-name { font-weight: 700; font-size: 0.95rem; }
+        .map-tooltip .mt-share { color: #6c757d; font-size: 0.76rem; margin: 2px 0 0 19px; }
+        .map-tooltip .mt-empty { color: #6c757d; font-size: 0.8rem; }
+        .map-tooltip .mt-stats { display: flex; gap: 8px; margin-top: 10px; }
+        .map-tooltip .mt-stats div { flex: 1; background: #f4f6f9; border-radius: 10px; padding: 6px 8px; text-align: center; }
+        .map-tooltip .mt-stats b { display: block; font-size: 0.95rem; }
+        .map-tooltip .mt-stats span { color: #6c757d; font-size: 0.7rem; }
+        .map-legend { position: absolute; left: 16px; bottom: 16px; background: rgba(255,255,255,0.94); border-radius: 12px;
+            box-shadow: 0 4px 16px rgba(0,0,0,0.12); padding: 10px 12px; font-size: 0.8rem; max-width: 260px; z-index: 5; }
+        .map-legend-title { font-weight: 700; margin-bottom: 6px; color: #212529; }
+        .map-legend-item { display: flex; align-items: center; gap: 8px; padding: 2px 0; color: #212529; text-decoration: none; }
+        a.map-legend-item:hover { text-decoration: underline; }
+        .map-legend-swatch { width: 14px; height: 14px; border-radius: 3px; flex-shrink: 0; border: 1px solid rgba(0,0,0,0.15); }
+        .map-legend-count { margin-left: auto; color: #6c757d; font-size: 0.72rem; }
     </style>
 </head>
 <body>
@@ -135,6 +159,20 @@
 
         <div class="col-md-9 col-lg-10 map-container">
             <div id="main-map"></div>
+            <div id="mapTooltip" class="map-tooltip"></div>
+            {% if map_legend %}
+            <div class="map-legend">
+                <div class="map-legend-title">Leading party by votes</div>
+                {% for item in map_legend %}
+                <a class="map-legend-item" href="/party?year={{ current_year }}&name={{ item.party | urlencode }}">
+                    <span class="map-legend-swatch" style="background: {{ item.color }};"></span>
+                    <span>{{ item.party }}</span>
+                    <span class="map-legend-count">{{ item.areas }}</span>
+                </a>
+                {% endfor %}
+                {% if map_missing %}<div class="map-legend-item"><span class="map-legend-swatch" style="background:#E0E0E0;"></span><span>No party data</span></div>{% endif %}
+            </div>
+            {% endif %}
         </div>
     </div>
 </div>
@@ -190,13 +228,36 @@
             }
         });
         
+        const mapTip = document.getElementById('mapTooltip');
+        const mapBox = document.getElementById(divId).parentElement;
+        function placeTip(ev) {
+            if (!ev) return;
+            const box = mapBox.getBoundingClientRect();
+            let x = ev.clientX - box.left + 16, y = ev.clientY - box.top + 16;
+            if (x + mapTip.offsetWidth > box.width - 8) x = ev.clientX - box.left - mapTip.offsetWidth - 16;
+            if (y + mapTip.offsetHeight > box.height - 8) y = ev.clientY - box.top - mapTip.offsetHeight - 16;
+            mapTip.style.left = Math.max(8, x) + 'px';
+            mapTip.style.top = Math.max(8, y) + 'px';
+        }
+        document.getElementById(divId).addEventListener('mousemove', ev => {
+            if (mapTip.classList.contains('show')) placeTip(ev);
+        });
+
         document.getElementById(divId).on('plotly_hover', function(data){
+            const cd = data.points?.[0]?.customdata;
+            if (cd) {
+                mapTip.innerHTML = cd[0];
+                mapTip.style.borderTopColor = cd[1];
+                mapTip.classList.add('show');
+                placeTip(data.event);
+            }
             const regionSlug = data.points?.[0]?.location;
             document.getElementById(divId).style.cursor =
                 availableRegionSlugs.has(regionSlug) ? 'pointer' : 'not-allowed';
         });
 
         document.getElementById(divId).on('plotly_unhover', function(data){
+            mapTip.classList.remove('show');
             document.getElementById(divId).style.cursor = 'default';
         });
     }

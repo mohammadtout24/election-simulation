@@ -348,7 +348,90 @@ def deduplicated_display_regions(regions):
     return result
 
 
-def create_interactive_map(regions, selected_year):
+# Map colouring by leading party. Each map polygon covers one or more qadas
+# (the DISTRICT value of its candidates).
+SLUG_QADAS = {
+    "akkar": ["عكار"], "tripoli": ["طرابلس"], "miniyeh_danniyeh": ["المنية", "الضنية"],
+    "batroun": ["البترون"], "bcharreh": ["بشري"], "koura": ["الكورة"], "zgharta": ["زغرتا"],
+    "jbayl": ["جبيل"], "kesrouan": ["كسروان"], "matn": ["المتن"], "baabda": ["بعبدا"],
+    "aley": ["عاليه"], "chouf": ["الشوف"], "jezzine": ["جزين"], "saida": ["صيدا"],
+    "sour": ["صور"], "zahrany": ["قرى صيدا"], "baalbek_hermel": ["بعلبك الهرمل"],
+    "zahleh": ["زحلة"], "westbekaa_rachaya": ["البقاع الغربي وراشيا"],
+    "bent_jbayl": ["بنت جبيل"], "marjayoun_hasbaya": ["مرجعيون وحاصبيا"], "nabatiyeh": ["النبطية"],
+    "beirut_two": ["بيروت الثانية"], "beirut_one": ["بيروت الأولى"],
+}
+
+# Colours commonly associated with the main parties. Variants such as
+# "(سابقاً)", "مقرب من …" and "مدعوم من …" take their parent party's colour.
+PARTY_COLORS = {
+    "حزب الله": "#F9A825",
+    "حركة أمل": "#2E7D32",
+    "القوات اللبنانية": "#C62828",
+    "التيار الوطني الحر": "#EF6C00",
+    "تيار المستقبل": "#1565C0",
+    "الحزب التقدمي الاشتراكي": "#AD1457",
+    "حزب الكتائب اللبنانية": "#00897B",
+    "تيار المردة": "#558B2F",
+    "تيار العزم": "#00ACC1",
+    "حزب الطشناق": "#455A64",
+    "تيار الكرامة": "#8E24AA",
+    "التنظيم الشعبي الناصري": "#6D4C41",
+    "الحزب الديمقراطي اللبناني": "#A1887F",
+    "الحزب السوري القومي الاجتماعي": "#37474F",
+    "جمعية المشاريع (الأحباش)": "#827717",
+    "الجماعة الإسلامية": "#004D40",
+}
+OTHER_PARTY_COLOR = "#78909C"
+NO_PARTY_COLOR = "#E0E0E0"
+NON_PARTY_LABELS = {"مستقل"}
+
+
+def party_family(party: str) -> str:
+    """Parent party of a label: strips "(سابقاً)" and "مقرب من / مدعوم من"."""
+    name = re.sub(r"\s*\(سابقاً\)\s*$", "", str(party or "")).strip()
+    name = re.sub(r"^(مقرب من|مدعوم من)\s+", "", name).strip()
+    return name
+
+
+def party_color(party: str) -> str:
+    return PARTY_COLORS.get(party_family(party), OTHER_PARTY_COLOR)
+
+
+def map_top_parties(regions, selected_year):
+    """{slug: {party, votes, share, color}}: the party whose candidates got
+    the most preferential votes in each map area (independents and unknown
+    affiliations excluded)."""
+    result = {}
+    by_file = {}
+    for region in regions:
+        file_id = region["files"].get(selected_year)
+        if file_id:
+            by_file.setdefault(file_id, []).append(region["slug"])
+    for file_id, slugs in by_file.items():
+        df = get_candidates_df(file_id)
+        if df is None or df.empty:
+            continue
+        party_map = get_party_map(file_id)
+        df = df.assign(PARTY=[party_map.get(str(c), "") for c in df["CANDIDATE_ID"]],
+                       QADA=df["DISTRICT"].map(_nrm))
+        for slug in slugs:
+            qadas = {_nrm(q) for q in SLUG_QADAS.get(slug, [])}
+            area = df[df["QADA"].isin(qadas)] if qadas else df
+            if area.empty:
+                area = df
+            total = int(area["VOTES"].sum())
+            known = area[(area["PARTY"] != "") & (~area["PARTY"].isin(NON_PARTY_LABELS))]
+            if known.empty:
+                continue
+            family_votes = known.groupby(known["PARTY"].map(party_family))["VOTES"].sum().sort_values(ascending=False)
+            party, votes = family_votes.index[0], int(family_votes.iloc[0])
+            result[slug] = {"party": party, "votes": votes,
+                            "share": round(votes / total * 100, 1) if total else 0.0,
+                            "color": party_color(party)}
+    return result
+
+
+def create_interactive_map(regions, selected_year, top_parties=None):
     if not regions:
         return "{}"
 
@@ -413,7 +496,12 @@ def create_interactive_map(regions, selected_year):
         else "No data"
         for slug in gdf["slug"]
     ]
-    color_map = {str(slug): REGION_COLORS.get(str(slug), DEFAULT_COLOR) for slug in gdf["slug"]}
+    top_parties = top_parties if top_parties is not None else map_top_parties(regions, selected_year)
+    gdf["Top Party"] = [
+        f"{top_parties[s]['party']} ({top_parties[s]['share']}% of votes)" if s in top_parties else "No party data"
+        for s in (str(x) for x in gdf["slug"])
+    ]
+    color_map = {str(slug): top_parties.get(str(slug), {}).get("color", NO_PARTY_COLOR) for slug in gdf["slug"]}
 
     geojson = json.loads(gdf.to_json())
     fig = px.choropleth(
@@ -427,11 +515,43 @@ def create_interactive_map(regions, selected_year):
         hover_data={
             "slug": False,
             "District": False,
+            "Top Party": True,
             "Total Voters": True,
             "Data Available": True,
         },
     )
     fig.update_traces(marker_line_width=1, marker_line_color="black")
+
+    # Tooltip content (rendered by the page as an HTML card, not Plotly's label).
+    # One trace per map area: px.choropleth splits traces by colour key.
+    def hover_html(slug):
+        region = region_by_slug[slug]
+        file_id = region["files"].get(selected_year)
+        html = (f"<div class='mt-title'>{region['district_label']}</div>"
+                f"<div class='mt-sub'>{region['name']}</div>")
+        if not file_id:
+            return html + f"<div class='mt-empty'>No {selected_year} election data</div>"
+        seats = int(sum(get_quota(file_id).get("rel_limits", {}).values()))
+        votes = totals.get(region["district_code"], 0)
+        top = top_parties.get(slug)
+        if top:
+            html += (f"<div class='mt-party'><span class='mt-dot' style='background:{top['color']}'></span>"
+                     f"<span class='mt-party-name'>{top['party']}</span></div>"
+                     f"<div class='mt-share'>Leading party · {top['share']}% of votes here</div>")
+        else:
+            html += "<div class='mt-empty'>No party data</div>"
+        html += (f"<div class='mt-stats'><div><b>{votes:,}</b><span>votes</span></div>"
+                 f"<div><b>{seats}</b><span>seats</span></div></div>")
+        return html
+
+    for trace in fig.data:
+        slug = str(trace.locations[0]) if len(trace.locations) else ""
+        if slug not in region_by_slug:
+            continue
+        trace.customdata = [[hover_html(slug), top_parties.get(slug, {}).get("color", "#adb5bd")]] * len(trace.locations)
+        trace.hovertemplate = None
+        trace.hoverinfo = "none"
+
     fig.update_geos(fitbounds="locations", visible=False, bgcolor="rgba(0,0,0,0)")
     fig.update_layout(
         margin={"r": 0, "t": 0, "l": 0, "b": 0},
@@ -1786,9 +1906,18 @@ def index():
         for region in deduplicated_display_regions(available_regions)
     ]
 
+    top_parties = map_top_parties(map_regions, selected_year)
+    legend = {}
+    for info in top_parties.values():
+        entry = legend.setdefault(info["party"], {"party": info["party"], "color": info["color"], "areas": 0})
+        entry["areas"] += 1
+    map_legend = sorted(legend.values(), key=lambda e: -e["areas"])
+
     return render_template(
         "index.html",
-        map_json=create_interactive_map(map_regions, selected_year),
+        map_json=create_interactive_map(map_regions, selected_year, top_parties),
+        map_legend=map_legend,
+        map_missing=len(top_parties) < len(map_regions),
         regions=unique_districts,
         available_slugs=[region["slug"] for region in available_regions],
         current_year=selected_year,
