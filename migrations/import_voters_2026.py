@@ -65,6 +65,14 @@ INDEXES = """
 CREATE INDEX IF NOT EXISTS idx_voters_2026_file ON voters_2026 (source_file);
 CREATE INDEX IF NOT EXISTS idx_voters_2026_town ON voters_2026 (electoral_district, town);
 CREATE INDEX IF NOT EXISTS idx_voters_2026_town_norm ON voters_2026 (town_norm);
+CREATE INDEX IF NOT EXISTS idx_voters_2026_browse ON voters_2026 (source_file, town, family_name, first_name, id);
+DROP TABLE IF EXISTS voter_towns_2026;
+CREATE TABLE voter_towns_2026 AS
+    SELECT source_file, town, COUNT(*)::int AS voters,
+           SUM(CASE WHEN gender = 'الذكور' THEN 1 ELSE 0 END)::int AS men,
+           SUM(CASE WHEN gender = 'الإناث' THEN 1 ELSE 0 END)::int AS women
+    FROM voters_2026 GROUP BY source_file, town;
+CREATE INDEX IF NOT EXISTS idx_voter_towns_2026_file ON voter_towns_2026 (source_file);
 """
 
 

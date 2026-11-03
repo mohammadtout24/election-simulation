@@ -2351,7 +2351,22 @@ def party_detail():
         if file_id:
             labels[parse_file_id(file_id)[1]] = {"label": region["district_label"], "slug": region["slug"], "file_id": file_id}
 
-    params = {"year": int(year), "party": party}
+    # A map link (family=1) covers the whole party family: "(سابقاً)",
+    # "مقرب من …" and "مدعوم من …" variants. A plain link uses the exact
+    # label, falling back to the family when that label has no candidates
+    # in the selected year (e.g. "تيار المستقبل" is "(سابقاً)" in 2022).
+    family = request.args.get("family") == "1"
+    with DB_ENGINE.connect() as conn:
+        year_labels = [r[0] for r in conn.execute(text(
+            "SELECT DISTINCT party FROM election_members WHERE year = :year AND party IS NOT NULL"
+        ), {"year": int(year)}).all()]
+    family_labels = sorted(p for p in year_labels if party_family(p) == party_family(party))
+    if family or party not in year_labels:
+        party_labels = family_labels
+    else:
+        party_labels = [party]
+
+    params = {"year": int(year), "party": party_labels}
     with DB_ENGINE.connect() as conn:
         cand_rows = conn.execute(text("""
             SELECT m.district_code, CAST(m.candidate_id AS TEXT) AS cid, m.member, m.group_name, m.religion,
@@ -2359,13 +2374,14 @@ def party_detail():
             FROM election_members m
             LEFT JOIN election_votes v
               ON v.year = m.year AND v.district_code = m.district_code AND v.candidate_id = m.candidate_id
-            WHERE m.year = :year AND m.party = :party
+            WHERE m.year = :year AND m.party = ANY(:party)
             GROUP BY m.district_code, m.candidate_id, m.member, m.group_name, m.religion, m.district, m.is_winner
             ORDER BY votes DESC
         """), params).mappings().all()
         if not cand_rows:
             # The party may simply not have run in this year (the page has a year toggle).
-            return render_template("party.html", party=party, year=year, total_votes=0, seats=0,
+            return render_template("party.html", party=party, year=year, family=family, party_labels=party_labels,
+                                   total_votes=0, seats=0,
                                    candidates=[], districts=[], areas=[], pens=[], top_n=top_n)
         district_totals = dict(conn.execute(text("""
             SELECT district_code, COALESCE(SUM(votes), 0)::bigint
@@ -2378,7 +2394,7 @@ def party_detail():
                 FROM election_pen_votes v
                 JOIN election_members m
                   ON m.year = v.year AND m.district_code = v.district_code AND m.candidate_id = v.candidate_id
-                WHERE v.year = :year AND m.party = :party
+                WHERE v.year = :year AND m.party = ANY(:party)
                   AND v.neighborhood IS NOT NULL AND v.neighborhood NOT IN ('', 'nan')
                 GROUP BY v.district_code, v.neighborhood
                 ORDER BY votes DESC LIMIT :n
@@ -2395,7 +2411,7 @@ def party_detail():
                 FROM election_pen_votes v
                 JOIN election_members m
                   ON m.year = v.year AND m.district_code = v.district_code AND m.candidate_id = v.candidate_id
-                WHERE v.year = :year AND m.party = :party
+                WHERE v.year = :year AND m.party = ANY(:party)
                 GROUP BY v.district_code, v.ballot_pen
                 ORDER BY votes DESC LIMIT :n
             )
@@ -2446,9 +2462,72 @@ def party_detail():
                            "votes": int(r["votes"]), "is_winner": bool(r["is_winner"])})
 
     return render_template(
-        "party.html", party=party, year=year, total_votes=total_votes,
+        "party.html", party=party, year=year, family=family, party_labels=party_labels, total_votes=total_votes,
         seats=sum(1 for c in candidates if c["is_winner"]), candidates=candidates,
         districts=district_list, areas=areas, pens=pens, top_n=top_n,
+    )
+
+
+@app.route("/voters")
+def voters_2026_page():
+    """Browse the 2026 voter registry: choose a district file, then a city/town."""
+    source = request.args.get("district", "").strip()
+    town = request.args.get("town", "").strip()
+    q = request.args.get("q", "").strip()
+    sect = request.args.get("sect", "").strip()
+    gender = request.args.get("gender", "").strip()
+    try:
+        page = max(1, int(request.args.get("page", "1")))
+    except ValueError:
+        page = 1
+    per_page = 100
+
+    districts, towns, voters, sects = [], [], [], []
+    town_info, total = None, 0
+    try:
+        with DB_ENGINE.connect() as conn:
+            districts = conn.execute(text("""
+                SELECT source_file, SUM(voters)::int AS voters, COUNT(*)::int AS towns
+                FROM voter_towns_2026 GROUP BY source_file ORDER BY source_file
+            """)).mappings().all()
+            if source:
+                towns = conn.execute(text("""
+                    SELECT town, voters, men, women FROM voter_towns_2026
+                    WHERE source_file = :s ORDER BY town
+                """), {"s": source}).mappings().all()
+            if source and town:
+                town_info = next((t for t in towns if t["town"] == town), None)
+                where = "source_file = :s AND town = :t"
+                params = {"s": source, "t": town}
+                if q:
+                    where += (" AND (first_name || ' ' || family_name || ' ' || father_name || ' ' || mother_name)"
+                              " ILIKE :q")
+                    params["q"] = f"%{q}%"
+                if sect:
+                    where += " AND personal_sect = :sect"
+                    params["sect"] = sect
+                if gender:
+                    where += " AND gender = :gender"
+                    params["gender"] = gender
+                total = conn.execute(text(f"SELECT COUNT(*) FROM voters_2026 WHERE {where}"), params).scalar() or 0
+                voters = conn.execute(text(f"""
+                    SELECT first_name, family_name, father_name, mother_name, birth_date, personal_sect,
+                           registry_sect, gender, registry_number, country
+                    FROM voters_2026 WHERE {where}
+                    ORDER BY family_name, first_name, id LIMIT :lim OFFSET :off
+                """), {**params, "lim": per_page, "off": (page - 1) * per_page}).mappings().all()
+                sects = conn.execute(text("""
+                    SELECT personal_sect, COUNT(*)::int AS n FROM voters_2026
+                    WHERE source_file = :s AND town = :t AND personal_sect <> ''
+                    GROUP BY personal_sect ORDER BY n DESC
+                """), {"s": source, "t": town}).mappings().all()
+    except Exception as exc:
+        print(f"Voters page failed: {exc}")
+
+    return render_template(
+        "voters.html", districts=districts, towns=towns, source=source, town=town, town_info=town_info,
+        voters=voters, total=int(total), sects=sects, q=q, sect=sect, gender=gender,
+        page=page, pages=max(1, -(-int(total) // per_page)), per_page=per_page,
     )
 
 

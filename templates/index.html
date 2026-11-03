@@ -144,6 +144,7 @@
                 </div>
                 <a href="/national?year={{ current_year }}" class="btn btn-sm btn-outline-success w-100 mt-2 fw-bold">🏛️ National Results</a>
                 <a href="/parties?year={{ current_year }}" class="btn btn-sm btn-outline-primary w-100 mt-2 fw-bold">🎗️ Party Analytics</a>
+                <a href="/voters" class="btn btn-sm btn-outline-secondary w-100 mt-2 fw-bold">🗳️ Voters 2026</a>
                 <input id="districtSearch" class="form-control sidebar-search" type="search" placeholder="Search district..." oninput="filterDistricts()">
             </div>
 
@@ -164,7 +165,7 @@
             <div class="map-legend">
                 <div class="map-legend-title">Leading party by votes</div>
                 {% for item in map_legend %}
-                <a class="map-legend-item" href="/party?year={{ current_year }}&name={{ item.party | urlencode }}">
+                <a class="map-legend-item" href="/party?year={{ current_year }}&family=1&name={{ item.party | urlencode }}">
                     <span class="map-legend-swatch" style="background: {{ item.color }};"></span>
                     <span>{{ item.party }}</span>
                     <span class="map-legend-count">{{ item.areas }}</span>
