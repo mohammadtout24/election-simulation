@@ -32,7 +32,6 @@
         <div class="d-flex gap-2">
             <a href="/parties?year=2018" class="btn btn-{{ 'primary' if current_year == '2018' else 'outline-primary' }} fw-bold">2018</a>
             <a href="/parties?year=2022" class="btn btn-{{ 'primary' if current_year == '2022' else 'outline-primary' }} fw-bold">2022</a>
-            <a href="/national?year={{ current_year }}" class="btn btn-outline-success fw-bold">🏛️ National Results</a>
             <a href="/?year={{ current_year }}" class="btn btn-outline-dark">← Map</a>
         </div>
     </div>
@@ -175,5 +174,6 @@
     if (votesChart.data) Plotly.newPlot('votesChart', votesChart.data, votesChart.layout, {responsive:true, displayModeBar:false});
     {% endif %}
 </script>
+{% include "_sidebar.html" %}
 </body>
 </html>
